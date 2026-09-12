@@ -126,6 +126,7 @@ _CAPABILITY_DOC_PAGES = _capability_doc_pages()
 _CAPABILITY_PAGE_META = {
     'advisor.md': ('advisor', 'Advisor'),
     'aws-lambda.md': ('aws_lambda', 'AWS Lambda Durability'),
+    'render-workflows.md': ('render', 'Render Workflows'),
     'code-mode.md': ('code_mode', 'Code Mode'),
     'coder.md': ('coder', 'Coder'),
     'skills.md': ('skills', 'Skills'),
