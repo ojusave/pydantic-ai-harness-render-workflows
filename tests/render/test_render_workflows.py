@@ -10,12 +10,16 @@ import pytest
 from pydantic_ai import Agent, FunctionToolset, RunContext, ToolsetTool
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import DynamicToolset
 from render.workflows import TaskContext, TaskDefinition, Workflows
 
 from pydantic_ai_harness import RenderWorkflows
+from pydantic_ai_harness.subagents import SubAgent, SubAgents
+from pydantic_ai_harness.tool_output_limits import ToolOutputLimits
 
 P = ParamSpec('P')
 R = TypeVar('R')
@@ -219,6 +223,79 @@ async def test_dynamic_tool_cannot_opt_out_of_render_child_task() -> None:
     assert inspect.isawaitable(pending_result)
     with pytest.raises(UserError, match='only for function tools'):
         await pending_result
+
+
+def build_delegating_agent() -> tuple[Agent[None, str], RenderWorkflows[None], Workflows]:
+    """A parent that delegates once to a sub-agent carrying its own model.
+
+    Both capabilities contribute a leaf `FunctionToolset`, which a durable engine can only
+    register when it has an `id`. Neither is wrapped by anything here: registering the
+    capabilities as they ship is the point.
+    """
+    worker = Agent(
+        FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart('worker result')])),
+        name='worker',
+        description='Does the work',
+    )
+
+    steps = {'n': 0}
+
+    def parent_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        steps['n'] += 1
+        if steps['n'] == 1:
+            args: dict[str, Any] = {'agent_name': 'worker', 'task': 'do it'}
+            return ModelResponse(parts=[ToolCallPart('delegate_task', args, tool_call_id='c1')])
+        return ModelResponse(parts=[TextPart('all done')])
+
+    workflows = Workflows()
+    render_workflows = RenderWorkflows[None](workflows, deps_type=type(None))
+    agent = Agent[None, str](
+        FunctionModel(parent_model),
+        name='support',
+        deps_type=type(None),
+        capabilities=[
+            SubAgents[None](agents=[SubAgent(worker)], agent_folders=None),
+            ToolOutputLimits[None](),
+            render_workflows,
+        ],
+    )
+    return agent, render_workflows, workflows
+
+
+def test_capability_toolsets_register_render_tasks_under_their_capability_id() -> None:
+    _, _, workflows = build_delegating_agent()
+
+    names = set(workflows._registry.get_task_names())
+
+    # Task names are persisted journal data, so they are pinned here: a rename strands
+    # in-flight workflows recorded against the old name.
+    assert {
+        'support__function_toolset__sub_agents.call_tool',
+        'support__function_toolset__sub_agents.validate_args',
+        'support__function_toolset__tool_output_limits.call_tool',
+        'support__function_toolset__tool_output_limits.validate_args',
+    } <= names
+
+
+@pytest.mark.anyio
+async def test_delegation_to_a_sub_agent_with_its_own_model_runs_in_a_render_task() -> None:
+    agent, render_workflows, _ = build_delegating_agent()
+
+    @render_workflows.task
+    async def run_agent(ctx: TaskContext, prompt: str) -> str:
+        del ctx
+        return (await agent.run(prompt)).output
+
+    context = RecordingTaskContext()
+    pending_result = run_agent.func(context, 'go')
+    assert inspect.isawaitable(pending_result)
+    result = await pending_result
+
+    # The delegate tool runs inside a child task, where the run context is a projection of
+    # the parent's and has no readable `model`. A sub-agent with its own model must not need
+    # one: reading it there would fail the delegation outright.
+    assert result == 'all done'
+    assert context.task_names.count('support__function_toolset__sub_agents.call_tool') == 1
 
 
 @pytest.mark.anyio

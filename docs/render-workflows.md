@@ -133,6 +133,35 @@ A child task may run in a fresh process. The capability sends one versioned JSON
 
 Treat the complete agent run and tool side effects as at least once. A retry of an individual child task can repeat its external side effect if interruption occurs before Render records the result. A retry of the workflow entry task starts `agent.run(...)` again and can repeat model requests and tool calls that completed during the earlier attempt. The current Render SDK does not let this integration assign stable idempotency keys to child task calls or resume the Pydantic agent loop from a checkpoint.
 
+## Capability and task-lineage contract
+
+Capabilities that contribute a leaf toolset must propagate their stable
+capability `id` to that toolset. Render persists the generated task name, so a
+missing ID prevents registration and changing an ID can strand in-flight runs.
+Tests for a capability that wraps a toolset should assert both the leaf ID and
+the exact generated Render task names.
+
+Model objects do not cross a Render task boundary. A delegated agent with its
+own model keeps that model without reading the reconstructed parent context. A
+model-less delegate may inherit the parent model in-process, but durable
+delegates must configure an explicit model or select one from the `SubAgents`
+model menu. Do not serialize provider clients or credentials to imitate model
+inheritance.
+
+Render owns task-run lineage. Harness operations spawn children only through
+`TaskContext.run()` and cannot assign `parentTaskRunId` or `rootTaskRunId`.
+Consumers that display a run graph should prefer a populated
+`rootTaskRunId`, retain `parentTaskRunId` to calculate depth, and paginate every
+task-run page. If a platform version leaves the root field empty, scope the
+listing to the Workflow and walk parent links as a compatibility fallback.
+
+Regression coverage should have two layers:
+
+- deterministic harness tests for leaf IDs, task registration, JSON transport,
+  and delegation with an explicit child model;
+- an opt-in `render workflows dev` smoke test that starts a root task and
+  verifies model and tool child tasks across the real process boundary.
+
 ## Streaming and cancellation
 
 Streaming is buffered at the model-task boundary. The child task consumes the provider stream and returns its completed response and captured events. The workflow-side agent can replay them after the child task finishes, but provider tokens do not stream live across `ctx.run(...)`. An `event_stream_handler` follows the durable operation path and does not change this boundary.

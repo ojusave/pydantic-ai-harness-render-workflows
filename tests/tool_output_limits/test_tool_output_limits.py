@@ -1026,6 +1026,20 @@ class TestReadBack:
         out = await tool.function(_make_ctx(), 'h/1.0')  # type: ignore[attr-defined]
         assert 'hello' in out
 
+    def test_read_toolset_carries_the_capability_id(self):
+        # A durable engine registers a leaf toolset under its `id` and refuses one without it,
+        # so the capability's id has to reach the toolset it contributes.
+        cap: ToolOutputLimits[object] = ToolOutputLimits()
+        toolset = cap.get_toolset()
+        assert isinstance(toolset, FunctionToolset)
+        assert toolset.id == 'tool_output_limits'
+
+    def test_read_toolset_follows_a_custom_capability_id(self):
+        cap: ToolOutputLimits[object] = ToolOutputLimits(id='limits')
+        toolset = cap.get_toolset()
+        assert isinstance(toolset, FunctionToolset)
+        assert toolset.id == 'limits'
+
 
 # ---------------------------------------------------------------------------
 # Agent-path integration
