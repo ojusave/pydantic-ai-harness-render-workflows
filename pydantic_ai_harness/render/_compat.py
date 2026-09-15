@@ -1,10 +1,10 @@
 """Compatibility boundary for unpublished Pydantic AI durability semantics.
 
 Cross-process operation parameters, capability ownership, capability-operation
-discovery, and partial `RunContext` reconstruction do not yet have public APIs.
-Their private imports and unavoidable dynamic typing stay here so an upstream
-change has one repair point. Vendor and general framework internals do not
-belong in this module.
+discovery, leaf-toolset `id` assignment, and partial `RunContext` reconstruction
+do not yet have public APIs. Their private imports, the single private attribute
+write, and unavoidable dynamic typing stay here so an upstream change has one
+repair point. Vendor and general framework internals do not belong in this module.
 """
 
 from __future__ import annotations
@@ -79,6 +79,7 @@ __all__ = (
     'RenderRunContextCodec',
     'ToolsetCallToolParams',
     'ToolsetGetToolsParams',
+    'assign_toolset_id',
     'capability_operation_result_type',
     'get_capability_operation_declaration',
     'dump_json_object',
@@ -332,6 +333,36 @@ def get_capability_operation_declaration(
         return collect_capability_operations(capability)[operation]
     except KeyError as exc:
         raise ValueError(f'Capability {type(capability).__name__!r} has no operation {operation!r}.') from exc
+
+
+def assign_toolset_id(toolset: AbstractToolset[Any], toolset_id: str) -> None:
+    """Name one leaf toolset that reached Render with no `id`, before its tasks register.
+
+    This is the only private attribute write in the integration. Every leaf this
+    integration registers (`FunctionToolset`, `DynamicToolset`, `MCPToolset`) returns
+    `self._id` from its public `id` property and accepts an `id` only through its own
+    constructor. A toolset a capability builds is never constructed by the user, so the
+    public surface offers nowhere to name it, while Render task names are persisted
+    workflow identity and have to exist before the first `app.task` call.
+
+    The public property is read back immediately: if Pydantic AI moves where a toolset
+    keeps its `id`, this raises instead of registering tasks under a name the toolset
+    does not actually answer to.
+    """
+    try:
+        object.__setattr__(toolset, '_id', toolset_id)
+    except AttributeError as exc:  # pragma: no cover - every leaf Pydantic AI ships stores `_id` on the instance
+        raise UserError(
+            f'Cannot give {type(toolset).__name__} the `id` {toolset_id!r} that its Render task names are '
+            'registered under: Pydantic AI no longer keeps a leaf toolset `id` in `_id`. Update '
+            '`pydantic_ai_harness.render._compat.assign_toolset_id` for the version of Pydantic AI in use.'
+        ) from exc
+    if toolset.id != toolset_id:
+        raise UserError(
+            f'{type(toolset).__name__} still reports the `id` {toolset.id!r} after being assigned '
+            f'{toolset_id!r}: Pydantic AI no longer keeps a leaf toolset `id` in `_id`. Update '
+            '`pydantic_ai_harness.render._compat.assign_toolset_id` for the version of Pydantic AI in use.'
+        )
 
 
 def reject_unidentified_operation_capabilities(root_capability: AbstractCapability[Any]) -> None:

@@ -414,46 +414,77 @@ async def test_a_named_toolset_registers_its_render_tasks_under_its_id() -> None
     assert 'support__function_toolset__delegates.call_tool' in context.task_names
 
 
-def test_a_capability_that_names_no_toolset_cannot_be_registered() -> None:
-    """`SubAgents` builds its own toolset and names it nothing, and nothing public can.
+@pytest.mark.anyio
+async def test_delegation_through_sub_agents_registers_and_runs_as_a_render_child_task() -> None:
+    """`SubAgents` builds its own toolset and names it nothing, and the agent still binds.
 
-    Recorded as a test because it is a real loss rather than a hypothetical: an agent that
-    delegates through `SubAgents` cannot be constructed with `RenderWorkflows` until the
-    capability accepts an `id` for the toolset it creates. The alternative was registering
-    persisted task names derived from the capability's own id, which meant writing the
-    toolset's private `_id`.
+    The delegate tool is registered under the capability's own `id` and one delegation runs
+    across the child-task boundary: the sub-agent's model request happens inside the task
+    that carries the tool call, and its answer comes back as the tool result.
+
+    This covers registration and execution only. A delegation that really runs in another
+    process does not carry the parent's `usage` back, cannot emit to the parent's event
+    stream, and counts its `max_calls` budget per process, none of which this asserts.
     """
-    worker = Agent(TestModel(), name='worker', description='Does the work')
+    worker = Agent(
+        FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart('worker result')])),
+        name='worker',
+        description='Does the work',
+    )
+    steps = {'n': 0}
 
-    with pytest.raises(UserError, match='SubAgents'):
-        Agent[None, str](
-            TestModel(),
-            name='support',
-            deps_type=type(None),
-            capabilities=[
-                SubAgents[None](agents=[SubAgent(worker)], agent_folders=None),
-                RenderWorkflows[None](Workflows(), deps_type=type(None)),
-            ],
-        )
+    def parent_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        steps['n'] += 1
+        if steps['n'] == 1:
+            args: dict[str, Any] = {'agent_name': 'worker', 'task': 'do it'}
+            return ModelResponse(parts=[ToolCallPart('delegate_task', args, tool_call_id='c1')])
+        return ModelResponse(parts=[TextPart('all done')])
+
+    app = RegistrationRecordingWorkflows()
+    render_workflows = RenderWorkflows[None](app, deps_type=type(None))
+    agent = Agent[None, str](
+        FunctionModel(parent_model),
+        name='support',
+        deps_type=type(None),
+        capabilities=[
+            SubAgents[None](agents=[SubAgent(worker)], agent_folders=None),
+            render_workflows,
+        ],
+    )
+
+    assert 'support__function_toolset__sub_agents.call_tool' in app.registered_task_names
+
+    @render_workflows.task
+    async def run_agent(ctx: TaskContext, prompt: str) -> str:
+        del ctx
+        return (await agent.run(prompt)).output
+
+    context = RecordingTaskContext()
+    pending_result = run_agent.func(context, 'go')
+    assert inspect.isawaitable(pending_result)
+
+    assert await pending_result == 'all done'
+    assert context.task_names.count('support__function_toolset__sub_agents.call_tool') == 1
 
 
-def test_tool_output_limits_is_refused_as_an_unnamed_capability_toolset() -> None:
-    """`ToolOutputLimits` is the other documented unnamed FunctionToolset, and it is refused too.
+def test_tool_output_limits_registers_its_read_tool_under_the_capability_id() -> None:
+    """`ToolOutputLimits` is the other capability that contributes a toolset nobody holds.
 
-    Construction raises before any task definition is registered: the capability contributes
-    `read_tool_result` through a FunctionToolset the user never holds, so there is no public
-    place to give that toolset an `id`.
+    Its `read_tool_result` tool reaches Render through a `FunctionToolset` the user never
+    constructs, and the capability takes no Render-specific argument to make it nameable.
     """
-    with pytest.raises(UserError, match='ToolOutputLimits'):
-        Agent[None, str](
-            TestModel(),
-            name='support',
-            deps_type=type(None),
-            capabilities=[
-                ToolOutputLimits[None](),
-                RenderWorkflows[None](Workflows(), deps_type=type(None)),
-            ],
-        )
+    app = RegistrationRecordingWorkflows()
+    Agent[None, str](
+        TestModel(),
+        name='support',
+        deps_type=type(None),
+        capabilities=[
+            ToolOutputLimits[None](),
+            RenderWorkflows[None](app, deps_type=type(None)),
+        ],
+    )
+
+    assert 'support__function_toolset__tool_output_limits.call_tool' in app.registered_task_names
 
 
 def test_a_capability_contributing_operations_without_an_id_is_rejected_before_registration() -> None:

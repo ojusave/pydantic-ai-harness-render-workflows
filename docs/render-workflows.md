@@ -9,7 +9,7 @@ description: Run long-running, distributed Pydantic AI agents (research, batch d
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/render/)
 
-Not every agent shape composes today. The harness's `SubAgents` capability is refused at agent construction, so native sub-agent delegation is not available on this integration today. [What this integration refuses today](#what-this-integration-refuses-today) covers why and what works instead.
+The supported contract is narrower than the whole agent surface. Task definitions are named per leaf toolset, and everything an operation needs crosses as JSON. [Task names for capability toolsets](#task-names-for-capability-toolsets) and [JSON and dependency boundary](#json-and-dependency-boundary) are where that changes a design.
 
 > While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](index.md#version-policy).
 
@@ -77,7 +77,7 @@ Use it when the agent job itself needs long-running or distributed task compute.
 - a research agent that reads a list of sources over minutes and writes a report;
 - a document pipeline that grinds through a batch of files, repeating the same model and tool calls across many inputs;
 - a monitor or other scheduled job, triggered by a Render cron job that starts a root task run;
-- an agent that fans a question out to several delegates in parallel, written as a named `FunctionToolset` (see [What this integration refuses today](#what-this-integration-refuses-today));
+- an agent that fans a question out to several delegates in parallel, each delegation running as its own task run (see [Sub-agent delegation](#sub-agent-delegation));
 - any run that needs a failed step retried on its own, or background work that should outlive the HTTP request that started it.
 
 Do not wait until someone asks to deploy a web service on Render. A static site or ordinary web service does not register these tasks. Do not use this for Temporal-style replay, crash recovery, or resuming `agent.run` from a checkpoint: Render retries task runs, it does not replay the agent loop.
@@ -93,7 +93,7 @@ Registration and invocation are separate events, and they scale differently.
 **At construction**, binding the capability registers one task definition per supported operation:
 
 - model requests, buffered stream requests, compaction, and suspended-response cleanup;
-- per named function toolset, argument validation and tool calls;
+- per function toolset, argument validation and tool calls;
 - per MCP and dynamic toolset, discovery, instructions, validation, and calls;
 - `event_stream_handler` delivery;
 - each method another capability declares with `@durable_operation`.
@@ -104,17 +104,39 @@ Definitions register once, whatever the agent later does. Render currently limit
 
 Outside a `workflows.task` scope, these operations call their original Pydantic AI handlers inline, so the same agent still runs in local tests and in non-workflow code.
 
-## What this integration refuses today
+## Task names for capability toolsets
 
-Render task names are persisted workflow identity, so every registered leaf toolset needs a stable `id`. A capability that builds its own toolset internally leaves that toolset unnamed, and Pydantic AI publishes no stable-ID assignment API for naming it afterwards. Rather than derive a name from the capability or write the toolset's private field, `RenderWorkflows` raises a `UserError` at agent construction that names each offending capability and says how to fix it.
+Render task names are persisted workflow identity, so every registered leaf toolset needs a stable `id`.
 
-Today that error covers the harness's `SubAgents` and `ToolOutputLimits`, and any other capability that contributes an unnamed `FunctionToolset` or `DynamicToolset`. The error is raised at construction, before any task definition is registered, so the failure is a build-time message rather than a half-registered service.
+An `id` you set yourself always wins: that toolset registers under the name you gave it and nothing is derived for it. Two toolsets sharing one `id` reach Pydantic AI's own uniqueness check and raise there; nothing is renamed or disambiguated for you.
 
-Neither `SubAgents` nor `ToolOutputLimits` exposes a public toolset-id knob: the `id` field on each names the capability, not the toolset it builds, so there is nothing to pass through to fix the refusal. The way forward is to own the toolset yourself and attach the tools to the agent as `toolsets=[FunctionToolset(..., id='...')]`, which puts the registered name under your control. That gives you a named toolset, not the refused capability: a delegate tool you write does not reproduce `SubAgents`' delegation contract, and tools you name yourself do not reproduce `ToolOutputLimits`' measurement, spill, and read-back behavior.
+A capability that builds its own toolset internally leaves that toolset unnamed, and nobody writing `capabilities=[SubAgents(...)]` holds the toolset to name it. For an unnamed supported leaf that a capability owns, `RenderWorkflows` derives the `id` from the owning capability's `id` before anything registers. A capability `id` is unique within the agent and identical in the worker process, which is what makes the derived task name the same on both sides. Where one derived name would be taken twice, by a second leaf under the same capability or by a toolset already holding that name, the derivation appends a deterministic numeric suffix, so the second name is as stable as the first.
 
-A toolset that already carries an `id` registers under it. Two toolsets sharing one `id` reach Pydantic AI's own uniqueness check and raise there; nothing is renamed or disambiguated for you.
+Pydantic AI publishes no stable-id assignment API, so writing a derived `id` reaches a field that is not public. That write goes through this integration's single compatibility module rather than being spread through the code: see [Pydantic AI compatibility boundary](#pydantic-ai-compatibility-boundary).
 
-Delegation you write yourself as a named `FunctionToolset` registers and runs, and the boundary above is what makes its distributed form narrower than an in-process one. Because a delegate executes in its own task run and only its JSON return crosses back, expect its usage delta not to reach the parent, its buffered child events not to be replayed to the parent, and `max_calls` to have no shared counter across distributed delegates. Those are consequences of the documented JSON boundary rather than behavior measured here: the harness's `SubAgents` is refused at construction, so its distributed behavior has not been exercised at all. Carry the accounting and telemetry you need in the delegate's own return value.
+A capability with no `id` that owns an unnamed leaf has nothing to derive from, and neither does an unnamed toolset you attached yourself. Either one raises a `UserError` at agent construction naming what to fix, before any task definition is registered, so the failure is a build-time message rather than a half-registered service. Pass an `id` through the capability when it accepts one, or attach the tools to the agent with an explicit toolset `id`.
+
+## Sub-agent delegation
+
+Native delegation works here. The harness's `SubAgents` contributes a `FunctionToolset`, so its `delegate_task` tool gets a task definition under a name derived from the capability's `id`, and inside a `workflows.task` scope each delegation starts its own child task run with the retry, timeout, and plan from `tool_options`.
+
+The delegate's own work stays inside that task run. A sub-agent does not carry `RenderWorkflows` itself, so its model requests and its tool calls execute inline in the delegating task rather than as separately registered child tasks. Render shows one task run per delegation, not a task tree mirroring the delegate's agent loop. Inside that task run the delegate reads `ctx.model` normally, because the run's model id crosses and resolves against the worker's own registry (see [Models and task-run lineage](#models-and-task-run-lineage)).
+
+Only the delegate's JSON return crosses back, and in-process sharing does not survive that:
+
+- **Usage.** A delegation that shares the parent's `RunUsage` in one process cannot mutate it from another, so the child's usage delta does not reach the parent run.
+- **Events.** A delegate's events are buffered on the child side and are not merged into the parent's event stream.
+- **Call budgets.** `max_calls` counts delegations against a counter held in one process, so distributed delegations have no shared counter.
+
+Carry the accounting and telemetry you need in the delegate's own return value.
+
+## Large tool outputs
+
+`ToolOutputLimits` registers and runs as well. It measures and reduces a tool return where that return is produced, which inside a workflow is the child task run that produced it.
+
+Its `Spill` mode is the part to design around. A spill writes the full payload to a filesystem-backed store and hands the model a handle that a later `read_tool_result` call reads back. Task runs are separate processes and can execute on separate, isolated filesystems, so a handle written during one task run cannot be assumed readable by the task run that reads it, and nothing at the Render boundary shares that store for you.
+
+Inside a workflow, have tools return bounded JSON and keep a large artifact in storage that outlives a single task run: object storage, a database, or another durable service both sides can reach. Return its key and read the artifact back through a tool that fetches it.
 
 ## Task options and tool opt-out
 
@@ -171,9 +193,9 @@ Everything that crosses the task boundary is task state that Render stores: prom
 
 Keep secrets out of it. Read API keys, tokens, and credentials from environment variables inside the child task instead of passing them through `deps`, tool arguments, or task results.
 
-## Toolset ids, models, and task-run lineage
+## Models and task-run lineage
 
-Render identifies a leaf toolset's task definitions by its `id`, as described in [What this integration refuses today](#what-this-integration-refuses-today).
+Render identifies a leaf toolset's task definitions by its `id`, set or derived as described in [Task names for capability toolsets](#task-names-for-capability-toolsets).
 
 Model instances do not cross the boundary, but their ids do. A child task resolves the run's model id against the models registered in its own process (the agent's default model plus the `models={...}` entries) and reports that instance as `ctx.model`, which is what lets a tool or another capability read the model inside a child task. It resolves to the plain model rather than the workflow-side model wrapper, so that work stays in the task run already executing it. A plain-string default that each run resolves for itself has no registered instance, and `ctx.model` remains unavailable in a child task.
 

@@ -22,8 +22,7 @@ per-toolset validation and calls, event delivery, `@durable_operation` methods).
 supported invocation starts a child task run of that definition. Use it when the agent's own job is
 long-running or distributed; Render retries those task runs rather than replaying the agent loop.
 
-The supported contract is narrower than the agent surface, and the harness's `SubAgents` is refused at
-agent construction today, so read
+The supported contract is narrower than the agent surface, so read
 [the capability README](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/render/#readme)
 before designing around this. The points below are the ones that change a design.
 
@@ -56,23 +55,30 @@ async def support(ctx: TaskContext, prompt: str) -> str:
     return (await agent.run(prompt)).output
 ```
 
-## What is refused, and what to do instead
+## Task names for capability toolsets
 
-A capability that builds its own toolset leaves that toolset unnamed, and Pydantic AI publishes no stable-ID
-assignment API to name it afterwards. `RenderWorkflows` raises a `UserError` at agent construction naming
-each such capability rather than registering persisted task names nobody chose.
+Render task names are persisted workflow identity, so every registered leaf toolset needs a stable `id`. An
+`id` set on the toolset wins. For an unnamed supported leaf that a capability owns (nobody writing
+`capabilities=[SubAgents(...)]` holds that toolset), `RenderWorkflows` derives the `id` from the owning
+capability's `id` before anything registers, adding a deterministic numeric suffix where one derived name
+would be taken twice. A capability with no `id` that owns an unnamed leaf is refused with a `UserError` at
+agent construction, before any task registers: pass an `id` through the capability, or attach the tools
+yourself as `toolsets=[FunctionToolset(..., id='...')]`. Two toolsets sharing an explicit `id` reach
+Pydantic AI's own uniqueness check.
 
-Today that includes the harness's `SubAgents` and `ToolOutputLimits`, so native sub-agent delegation is not
-available on this integration today. Neither capability exposes a public toolset-id knob: their
-`id` field names the capability, not the toolset it builds. The alternative that works is a toolset you own,
-attached as `toolsets=[FunctionToolset(..., id='...')]`. That is your toolset under your name, not a
-re-creation of the refused capability's behavior.
+## Delegation and large tool outputs
 
-Delegation written as a named `FunctionToolset` registers and runs. Because the delegate executes in its own
-task run and only its JSON return crosses back, expect its usage delta and buffered child events not to
-reach the parent, and `max_calls` to have no shared counter across distributed delegates. Those follow from
-the JSON boundary and from `SubAgents` being refused at construction, not from measurements of distributed
-delegation.
+Native `SubAgents` registers and runs: `delegate_task` becomes a task definition and each delegation a child
+task run. The delegate's own model requests and tool calls execute inside that one task run, not as
+separately registered children, because a sub-agent does not carry `RenderWorkflows` itself. Only the
+delegate's JSON return crosses back, so the child's usage delta does not reach the parent, its buffered
+events are not merged into the parent's event stream, and `max_calls` has no counter shared across
+processes. Carry the accounting and telemetry you need in the delegate's own return value.
+
+`ToolOutputLimits` registers and runs too, but its `Spill` mode is filesystem-backed: task runs are separate
+processes on filesystems that may be isolated from each other, so a spill written in one task run cannot be
+assumed readable by the task run that calls `read_tool_result`. Inside a workflow, return bounded JSON and
+keep large artifacts in external durable storage, returning a key the read side can fetch.
 
 ## Other design constraints
 

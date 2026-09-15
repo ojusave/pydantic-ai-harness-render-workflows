@@ -42,7 +42,7 @@ from ._compat import (
 )
 from ._context import activate_task_context, current_task_context
 from ._operation_backend import RenderOperationBackend
-from ._toolset_ids import reject_unnameable_capability_toolsets
+from ._toolset_ids import prepare_capability_toolset_ids
 from ._transports import (
     RenderCancelTransport,
     RenderCapabilityOperationTransport,
@@ -284,9 +284,10 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         if self._deps_type is None:
             self._deps_type = agent.deps_type
 
-        # Render task names are persisted workflow identity, so an unnameable toolset is
-        # refused here rather than registered under a derived name.
-        reject_unnameable_capability_toolsets(agent.toolsets)
+        # Render task names are persisted workflow identity, so every leaf is named before
+        # the codec, the operation backend, and the event operation below start registering
+        # tasks: a name settled later would be a name nothing can go back and change.
+        prepare_capability_toolset_ids(agent.toolsets)
         # Pydantic AI reaches the same check while registering capability operations, by
         # which point this app is already holding tasks that nothing can unregister.
         reject_unidentified_operation_capabilities(agent.root_capability)
@@ -302,8 +303,8 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
             agent_name=self.name,
             config=self._operation_config,
         )
-        # Toolset identity was preflighted above, so the base bind cannot reject an invalid
-        # or duplicate ID after this event task is registered. Event binding must still come
+        # Toolset identity was settled above, so the base bind cannot reject an unnamed or
+        # duplicate ID after this event task is registered. Event binding must still come
         # first because the durable wrappers created by the base bind capture it.
         if self._event_stream_handler is not None:
             self._bound_event_operation = self._bind_event_operation(self._operation_backend)
