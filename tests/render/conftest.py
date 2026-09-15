@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import os
 import re
@@ -13,14 +14,33 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ParamSpec, TypeVar
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-pytest.importorskip('render')
+try:
+    _render_spec = importlib.util.find_spec('render')
+except ModuleNotFoundError as exc:
+    if exc.name != 'render':
+        raise
+    _render_spec = None
 
-from render.workflows import TaskContext, TaskDefinition
+if TYPE_CHECKING:
+    from render.workflows import TaskContext, TaskDefinition
+elif _render_spec is None:
+    collect_ignore_glob = ['*.py']
+
+    class TaskContext:
+        """Placeholder used only while pytest ignores Render-extra tests."""
+else:
+    from render.workflows import TaskContext, TaskDefinition
+
+
+def pytest_ignore_collect(collection_path: Path) -> bool:
+    """Ignore Render-extra tests only when the top-level optional package is absent."""
+    return _render_spec is None and collection_path.suffix == '.py'
+
 
 P = ParamSpec('P')
 R = TypeVar('R')
@@ -228,8 +248,8 @@ def _require_render_cli() -> None:
     if completed.returncode != 0 or version_match is None:
         pytest.skip(f'could not determine Render CLI version: {completed.stdout}{completed.stderr}'.strip())
     version = tuple(int(part) for part in version_match.groups())
-    if version < (2, 16, 0):
-        pytest.skip(f'local runtime test requires Render CLI >=2.16.0, found {version_match.group(0)}')
+    if version < (2, 28, 0):
+        pytest.skip(f'local runtime test requires Render CLI >=2.28.0, found {version_match.group(0)}')
 
 
 @pytest.fixture

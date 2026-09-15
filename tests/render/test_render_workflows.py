@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 from collections.abc import AsyncIterable, Callable
-from typing import Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import anyio
 import pytest
 from pydantic_ai import Agent, FunctionToolset, RunContext, ToolsetTool
 from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import (
     AgentStreamEvent,
     FinalResultEvent,
@@ -35,8 +35,16 @@ from pydantic_ai_harness.subagents import SubAgent, SubAgents
 
 from .conftest import RecordingTaskContext
 
+if TYPE_CHECKING:
+    # Only the MCP tests below need this class, and only at runtime when the optional MCP
+    # dependency is installed. Importing it here keeps the annotations precise without making
+    # the whole Render-extra test module require the MCP extra to be collected.
+    from pydantic_ai.mcp import MCPToolset
+
 P = ParamSpec('P')
 R = TypeVar('R')
+
+MCP_DEPENDENCY_MODULE = 'fastmcp'
 
 
 class RegistrationRecordingWorkflows(Workflows):
@@ -108,41 +116,69 @@ class FanOutRecordingTaskContext(RecordingTaskContext):
                 self.active_tool_tasks -= 1
 
 
-class FakeMCPToolset(MCPToolset[None]):
-    """In-memory MCP toolset used to exercise the public durable wrapper."""
+def mcp_dependency_installed() -> bool:
+    """Whether the optional MCP dependency `MCPToolset` needs is importable at all.
 
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.max_retries = None
-        self.cache_tools = True
-        self.include_instructions = False
-        self.include_return_schema = None
-        self.id = 'remote-tools'
+    A present-but-broken MCP installation still has a discoverable module, so the import in
+    `fake_mcp_toolset` below raises there instead of being turned into a skip.
+    """
+    try:
+        return importlib.util.find_spec(MCP_DEPENDENCY_MODULE) is not None
+    except ModuleNotFoundError as exc:
+        if exc.name != MCP_DEPENDENCY_MODULE:
+            raise
+        return False
 
-    async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
-        tool_def = ToolDefinition(
-            name='remote_lookup',
-            parameters_json_schema={
-                'type': 'object',
-                'properties': {'query': {'type': 'string'}},
-                'required': ['query'],
-            },
-        )
-        return {'remote_lookup': self.tool_for_tool_def(tool_def, ctx=ctx)}
 
-    async def get_instructions(self, ctx: RunContext[None]) -> None:
-        del ctx
+def fake_mcp_toolset() -> tuple[MCPToolset[None], list[tuple[str, dict[str, Any]]]]:
+    """An in-memory MCP toolset and the calls it records, built only when MCP is installed.
 
-    async def call_tool(
-        self,
-        name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[None],
-        tool: ToolsetTool[None],
-    ) -> str:
-        del ctx, tool
-        self.calls.append((name, tool_args))
-        return 'remote result'
+    `MCPToolset` is the base class, so the subclass cannot exist before the optional MCP
+    dependency does. Skipping here scopes the requirement to the MCP tests that call this.
+    """
+    if not mcp_dependency_installed():
+        pytest.skip(f'`MCPToolset` needs the optional `{MCP_DEPENDENCY_MODULE}` client from the `mcp` extra.')
+
+    from pydantic_ai.mcp import MCPToolset  # noqa: PLC0415  # needs the mcp extra
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeMCPToolset(MCPToolset[None]):
+        """In-memory MCP toolset used to exercise the public durable wrapper."""
+
+        def __init__(self) -> None:
+            self.max_retries = None
+            self.cache_tools = True
+            self.include_instructions = False
+            self.include_return_schema = None
+            self.id = 'remote-tools'
+
+        async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
+            tool_def = ToolDefinition(
+                name='remote_lookup',
+                parameters_json_schema={
+                    'type': 'object',
+                    'properties': {'query': {'type': 'string'}},
+                    'required': ['query'],
+                },
+            )
+            return {'remote_lookup': self.tool_for_tool_def(tool_def, ctx=ctx)}
+
+        async def get_instructions(self, ctx: RunContext[None]) -> None:
+            del ctx
+
+        async def call_tool(
+            self,
+            name: str,
+            tool_args: dict[str, Any],
+            ctx: RunContext[None],
+            tool: ToolsetTool[None],
+        ) -> str:
+            del ctx, tool
+            calls.append((name, tool_args))
+            return 'remote result'
+
+    return FakeMCPToolset(), calls
 
 
 class SuspendedModel(Model):
@@ -415,21 +451,16 @@ async def test_a_named_toolset_registers_its_render_tasks_under_its_id() -> None
 
 
 @pytest.mark.anyio
-async def test_delegation_through_sub_agents_registers_and_runs_as_a_render_child_task() -> None:
-    """`SubAgents` builds its own toolset and names it nothing, and the agent still binds.
-
-    The delegate tool is registered under the capability's own `id` and one delegation runs
-    across the child-task boundary: the sub-agent's model request happens inside the task
-    that carries the tool call, and its answer comes back as the tool result.
-
-    This covers registration and execution only. A delegation that really runs in another
-    process does not carry the parent's `usage` back, cannot emit to the parent's event
-    stream, and counts its `max_calls` budget per process, none of which this asserts.
-    """
-    worker = Agent(
+async def test_delegation_tool_stays_inline_while_explicit_child_operations_use_render_tasks() -> None:
+    """The unnamed capability tool stays inline while the configured child remains durable."""
+    app = RegistrationRecordingWorkflows()
+    child_render_workflows = RenderWorkflows[None](app, deps_type=type(None))
+    worker = Agent[None, str](
         FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart('worker result')])),
         name='worker',
         description='Does the work',
+        deps_type=type(None),
+        capabilities=[child_render_workflows],
     )
     steps = {'n': 0}
 
@@ -440,7 +471,6 @@ async def test_delegation_through_sub_agents_registers_and_runs_as_a_render_chil
             return ModelResponse(parts=[ToolCallPart('delegate_task', args, tool_call_id='c1')])
         return ModelResponse(parts=[TextPart('all done')])
 
-    app = RegistrationRecordingWorkflows()
     render_workflows = RenderWorkflows[None](app, deps_type=type(None))
     agent = Agent[None, str](
         FunctionModel(parent_model),
@@ -452,7 +482,8 @@ async def test_delegation_through_sub_agents_registers_and_runs_as_a_render_chil
         ],
     )
 
-    assert 'support__function_toolset__sub_agents.call_tool' in app.registered_task_names
+    assert 'worker__model.request' in app.registered_task_names
+    assert 'support__function_toolset__sub_agents.call_tool' not in app.registered_task_names
 
     @render_workflows.task
     async def run_agent(ctx: TaskContext, prompt: str) -> str:
@@ -464,15 +495,12 @@ async def test_delegation_through_sub_agents_registers_and_runs_as_a_render_chil
     assert inspect.isawaitable(pending_result)
 
     assert await pending_result == 'all done'
-    assert context.task_names.count('support__function_toolset__sub_agents.call_tool') == 1
+    assert context.task_names.count('worker__model.request') == 1
+    assert 'support__function_toolset__sub_agents.call_tool' not in context.task_names
 
 
-def test_tool_output_limits_registers_its_read_tool_under_the_capability_id() -> None:
-    """`ToolOutputLimits` is the other capability that contributes a toolset nobody holds.
-
-    Its `read_tool_result` tool reaches Render through a `FunctionToolset` the user never
-    constructs, and the capability takes no Render-specific argument to make it nameable.
-    """
+def test_tool_output_limits_unnamed_toolset_stays_inline() -> None:
+    """A capability-owned helper tool does not acquire a Render task identity."""
     app = RegistrationRecordingWorkflows()
     Agent[None, str](
         TestModel(),
@@ -484,7 +512,8 @@ def test_tool_output_limits_registers_its_read_tool_under_the_capability_id() ->
         ],
     )
 
-    assert 'support__function_toolset__tool_output_limits.call_tool' in app.registered_task_names
+    assert 'support__model.request' in app.registered_task_names
+    assert 'support__function_toolset__tool_output_limits.call_tool' not in app.registered_task_names
 
 
 def test_a_capability_contributing_operations_without_an_id_is_rejected_before_registration() -> None:
@@ -633,6 +662,7 @@ async def test_a_tool_in_a_child_task_reads_the_run_model_from_its_own_process()
 
 @pytest.mark.anyio
 async def test_mcp_tool_cannot_opt_out_of_render_child_task() -> None:
+    toolset, _calls = fake_mcp_toolset()
     workflows = Workflows()
     render_workflows = RenderWorkflows[None](
         workflows,
@@ -643,7 +673,7 @@ async def test_mcp_tool_cannot_opt_out_of_render_child_task() -> None:
         TestModel(call_tools=['remote_lookup']),
         name='mcp-support',
         deps_type=type(None),
-        toolsets=[FakeMCPToolset()],
+        toolsets=[toolset],
         capabilities=[render_workflows],
     )
 
@@ -660,9 +690,9 @@ async def test_mcp_tool_cannot_opt_out_of_render_child_task() -> None:
 
 @pytest.mark.anyio
 async def test_mcp_tool_discovery_and_call_run_as_render_child_tasks() -> None:
+    toolset, calls = fake_mcp_toolset()
     workflows = Workflows()
     render_workflows = RenderWorkflows[None](workflows, deps_type=type(None))
-    toolset = FakeMCPToolset()
     agent = Agent[None, str](
         TestModel(call_tools=['remote_lookup']),
         name='mcp-support',
@@ -681,7 +711,7 @@ async def test_mcp_tool_discovery_and_call_run_as_render_child_tasks() -> None:
     assert inspect.isawaitable(pending)
     assert isinstance(await pending, str)
 
-    assert toolset.calls == [('remote_lookup', {'query': 'a'})]
+    assert calls == [('remote_lookup', {'query': 'a'})]
     assert 'mcp-support__mcp_server__remote-tools.get_tools' in context.task_names
     assert 'mcp-support__mcp_server__remote-tools.call_tool' in context.task_names
 

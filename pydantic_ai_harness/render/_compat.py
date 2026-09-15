@@ -1,10 +1,10 @@
 """Compatibility boundary for unpublished Pydantic AI durability semantics.
 
 Cross-process operation parameters, capability ownership, capability-operation
-discovery, leaf-toolset `id` assignment, and partial `RunContext` reconstruction
-do not yet have public APIs. Their private imports, the single private attribute
-write, and unavoidable dynamic typing stay here so an upstream change has one
-repair point. Vendor and general framework internals do not belong in this module.
+discovery, and partial `RunContext` reconstruction do not yet have public APIs.
+Their private imports and unavoidable dynamic typing stay here so an upstream
+change has one repair point. Vendor and general framework internals do not belong
+in this module.
 """
 
 from __future__ import annotations
@@ -79,7 +79,6 @@ __all__ = (
     'RenderRunContextCodec',
     'ToolsetCallToolParams',
     'ToolsetGetToolsParams',
-    'assign_toolset_id',
     'capability_operation_result_type',
     'get_capability_operation_declaration',
     'dump_json_object',
@@ -92,6 +91,7 @@ __all__ = (
     'model_settings_from_json',
     'model_settings_to_json',
     'normalize_json_value',
+    'operation_run_context',
     'prepare_function_call_params',
     'reject_unidentified_operation_capabilities',
     'resolve_function_tool_for_definition',
@@ -233,6 +233,22 @@ def load_operation_params(
     return json_transport.load(payload, runtime=runtime)
 
 
+def operation_run_context(params: object) -> RunContext[Any] | None:
+    """Return the live caller context carried by a Pydantic AI operation."""
+    if isinstance(params, ToolsetCallToolParams | DynamicToolsetCallToolParams | ToolsetGetToolsParams):
+        return params.ctx
+    if isinstance(
+        params,
+        ModelRequestParams
+        | ModelCompactMessagesParams
+        | CapabilityOperationParams
+        | EventStreamHandlerParams
+        | ModelCancelSuspendedResponseParams,
+    ):
+        return params.run_context
+    return None
+
+
 async def prepare_function_call_params(
     agent: AbstractAgent[ToolDepsT, Any],
     toolset: FunctionToolset[ToolDepsT],
@@ -248,6 +264,10 @@ async def prepare_function_call_params(
                 f'Tool {params.name!r} not found in toolset {toolset.id!r}. '
                 'Removing or renaming tools during an agent run is not supported with Render Workflows.'
             ) from exc
+    from ._protocol import current_effect_recorder
+
+    if recorder := current_effect_recorder():
+        recorder.set_event_capability(tool.tool_def.capability_id)
     args = tool.args_validator.validate_python(
         params.tool_args,
         context=validation_context_from_agent(agent)(params.ctx),
@@ -296,7 +316,7 @@ def model_settings_from_json(value: JSONObject | None) -> ModelSettings | None:
     return settings
 
 
-def function_tool_original_name(tool: ToolsetTool[ToolDepsT]) -> str | None:
+def function_tool_original_name(tool: object) -> str | None:
     """Read function-tool identity without leaking its private concrete type."""
     if isinstance(tool, FunctionToolsetTool):
         return tool.original_name
@@ -356,36 +376,6 @@ def get_capability_operation_declaration(
         return collect_capability_operations(capability)[operation]
     except KeyError as exc:
         raise ValueError(f'Capability {type(capability).__name__!r} has no operation {operation!r}.') from exc
-
-
-def assign_toolset_id(toolset: AbstractToolset[Any], toolset_id: str) -> None:
-    """Name one leaf toolset that reached Render with no `id`, before its tasks register.
-
-    This is the only private attribute write in the integration. Every leaf this
-    integration registers (`FunctionToolset`, `DynamicToolset`, `MCPToolset`) returns
-    `self._id` from its public `id` property and accepts an `id` only through its own
-    constructor. A toolset a capability builds is never constructed by the user, so the
-    public surface offers nowhere to name it, while Render task names are persisted
-    workflow identity and have to exist before the first `app.task` call.
-
-    The public property is read back immediately: if Pydantic AI moves where a toolset
-    keeps its `id`, this raises instead of registering tasks under a name the toolset
-    does not actually answer to.
-    """
-    try:
-        object.__setattr__(toolset, '_id', toolset_id)
-    except AttributeError as exc:  # pragma: no cover - every leaf Pydantic AI ships stores `_id` on the instance
-        raise UserError(
-            f'Cannot give {type(toolset).__name__} the `id` {toolset_id!r} that its Render task names are '
-            'registered under: Pydantic AI no longer keeps a leaf toolset `id` in `_id`. Update '
-            '`pydantic_ai_harness.render._compat.assign_toolset_id` for the version of Pydantic AI in use.'
-        ) from exc
-    if toolset.id != toolset_id:
-        raise UserError(
-            f'{type(toolset).__name__} still reports the `id` {toolset.id!r} after being assigned '
-            f'{toolset_id!r}: Pydantic AI no longer keeps a leaf toolset `id` in `_id`. Update '
-            '`pydantic_ai_harness.render._compat.assign_toolset_id` for the version of Pydantic AI in use.'
-        )
 
 
 def reject_unidentified_operation_capabilities(root_capability: AbstractCapability[Any]) -> None:
@@ -461,6 +451,11 @@ class RenderRunContext(RunContext[AgentDepsT]):
         for name, wire_type, adapter in _REHYDRATORS:
             if isinstance(value := self.__dict__.get(name), wire_type):
                 self.__dict__[name] = adapter.validate_python(value)
+        from ._protocol import current_effect_recorder
+
+        usage = self.__dict__.get('usage')
+        if isinstance(usage, RunUsage) and (recorder := current_effect_recorder()):
+            recorder.watch_usage(usage)
         setattr(
             self,
             '__dataclass_fields__',
@@ -497,9 +492,33 @@ class RenderRunContext(RunContext[AgentDepsT]):
     async def emit(self, event: CapabilityEventT, /) -> CapabilityEventT: ...
 
     async def emit(self, event: CustomEvent | CapabilityEvent, /) -> CustomEvent | CapabilityEvent:
-        raise UserError(
-            'Emitting events from a tool or event stream handler is not supported inside a Render child task.'
-        )
+        from ._protocol import RenderProtocolError, current_effect_recorder
+
+        recorder = current_effect_recorder()
+        if recorder is None:
+            raise UserError(
+                'Emitting events from a tool or event stream handler is not supported inside a Render child task.'
+            )
+        capability_id = recorder.event_capability_id
+        if isinstance(event, CapabilityEvent):
+            if event.event_dispatch == 'immediate':
+                raise RenderProtocolError(
+                    'Immediate capability events are unsupported inside a Render child task because '
+                    'their listener decision must be available before the operation continues.'
+                )
+            if event.capability_id is None:
+                if capability_id is None:
+                    raise UserError(
+                        'Capability events belong to capabilities and cannot be emitted from an application tool.'
+                    )
+                event.capability_id = capability_id
+        elif capability_id is not None:
+            raise UserError('Capability-contributed tools must emit `CapabilityEvent`, not `CustomEvent`.')
+        if event.tool_call_id is None and self.tool_call_id is not None:
+            event.tool_call_id = self.tool_call_id
+            event.tool_name = self.tool_name
+        recorder.record_event(event)
+        return event
 
     @classmethod
     def serialize_run_context(cls, ctx: RunContext[Any]) -> dict[str, Any]:

@@ -17,9 +17,9 @@ license: MIT
 # Pydantic AI on Render Workflows
 
 `RenderWorkflows` runs a Pydantic AI agent on a [Render Workflows](https://render.com/docs/workflows) app.
-Constructing the agent registers one Render task definition per supported operation (model requests,
-per-toolset validation and calls, event delivery, `@durable_operation` methods). Inside a workflow, each
-supported invocation starts a child task run of that definition. Use it when the agent's own job is
+Constructing the agent registers Render task definitions for supported operations (model requests,
+static function-tool validation and calls, dynamic/MCP toolsets, event delivery, `@durable_operation`
+methods). Inside a workflow, each supported invocation starts a child task run. Use it when the agent's own job is
 long-running or distributed; Render retries those task runs rather than replaying the agent loop.
 
 The supported contract is narrower than the agent surface, so read
@@ -58,35 +58,35 @@ async def support(ctx: TaskContext, prompt: str) -> str:
 ## Task names for capability toolsets
 
 Render task names are persisted workflow identity, so every registered leaf toolset needs a stable `id`. An
-`id` set on the toolset wins. For an unnamed supported leaf that a capability owns (nobody writing
-`capabilities=[SubAgents(...)]` holds that toolset), `RenderWorkflows` derives the `id` from the owning
-capability's `id` before anything registers, adding a deterministic numeric suffix where one derived name
-would be taken twice. A capability with no `id` that owns an unnamed leaf is refused with a `UserError` at
-agent construction, before any task registers: pass an `id` through the capability, or attach the tools
-yourself as `toolsets=[FunctionToolset(..., id='...')]`. Two toolsets sharing an explicit `id` reach
-Pydantic AI's own uniqueness check.
+explicit `id` set at construction wins. Pydantic AI has no public API for assigning one later, so an unnamed
+capability-owned leaf stays inline and receives no independent Render task. An unnamed supported leaf attached
+directly by the application is refused before any task registers. Two explicit duplicate IDs reach Pydantic
+AI's own uniqueness check.
 
 ## Delegation and large tool outputs
 
-Native `SubAgents` registers and runs: `delegate_task` becomes a task definition and each delegation a child
-task run. The delegate's own model requests and tool calls execute inside that one task run, not as
-separately registered children, because a sub-agent does not carry `RenderWorkflows` itself. Only the
-delegate's JSON return crosses back, so the child's usage delta does not reach the parent, its buffered
-events are not merged into the parent's event stream, and `max_calls` has no counter shared across
-processes. Carry the accounting and telemetry you need in the delegate's own return value.
+`SubAgents` keeps its unnamed `delegate_task` tool inline. To run a delegate's supported model and tool
+operations as Render child task runs, explicitly construct that child Agent with `RenderWorkflows` using the
+same `Workflows` app as the parent. Successful child operations return usage deltas and buffered events in
+the JSON result envelope; the caller applies them once and preserves event order. `max_calls` remains correct
+within one active parent task run, but is not a global budget across root-task retries or processes.
+Immediate capability events cannot preserve their synchronous decision semantics in a child task and fail
+closed; keep tools that emit them inline.
 
-`ToolOutputLimits` registers and runs too, but its `Spill` mode is filesystem-backed: task runs are separate
-processes on filesystems that may be isolated from each other, so a spill written in one task run cannot be
-assumed readable by the task run that calls `read_tool_result`. Inside a workflow, return bounded JSON and
+`ToolOutputLimits` also keeps its unnamed helper tool inline. Its `Spill` mode is filesystem-backed: task
+runs and root-task retries can use different processes or filesystems, so persisted large outputs need shared
+storage. Inside a workflow, return bounded JSON and
 keep large artifacts in external durable storage, returning a key the read side can fetch.
 
 ## Other design constraints
 
-- Task options (retry, timeout, plan) are fixed at registration. One call task definition serves every tool
-  in its toolset. To give static tools distinct definitions and options, put each in its own named
-  `FunctionToolset`.
+- Task options (retry, timeout, plan) are fixed at registration. A resolver can assign different options to
+  statically known function tools in one named `FunctionToolset`; each eligible tool then receives its own
+  task definitions. Returning `False` keeps that function tool inline. Dynamic and MCP tools stay per-toolset.
 - Everything crossing the boundary must be JSON encodable, including `deps`, and the arguments of one task
   run must fit Render's documented 4 MB argument cap. Model instances do not cross; their ids do.
+- Current callers use protocol v2. New workers accept v1 requests and return effect-free v1 results, so
+  deploy workers before sending v2 work during an upgrade.
 - Render keeps task state for 30 days, so prompts, responses, tool arguments and results, and deps are
   retained. Read secrets from environment variables inside the child task instead of sending them through.
 - Streaming is buffered at the model-task boundary; provider tokens do not stream live across `ctx.run(...)`.

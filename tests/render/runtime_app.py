@@ -1,118 +1,254 @@
-"""Process-isolated Render Workflows fixture used by the local-runtime test."""
+"""Process-isolated nested-agent fixture used by the local-runtime test."""
 
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 from pydantic import BaseModel, TypeAdapter
-from pydantic_ai import Agent, ModelRetry, RunContext
-from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai import Agent, CustomEvent, ModelRetry, RunContext
+from pydantic_ai.capabilities import Hooks
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
+from pydantic_ai.usage import RunUsage
 from render.workflows import TaskContext, Workflows
 from typing_extensions import TypedDict
 
 from pydantic_ai_harness import RenderWorkflows
+from pydantic_ai_harness.subagents import SubAgent, SubAgents
 
 
 class RuntimeDeps(TypedDict):
-    """Serializable values transported to isolated operation tasks."""
-
     prefix: str
     controller_pid: int
 
 
-class IsolatedLookupResult(BaseModel):
-    """Evidence returned after one Pydantic AI model-requested tool retry."""
-
-    controller_pid: int
-    deps_prefix: str
-    model_pid: int
-    model_retry_count: int
-    tool_pid: int
+class ToolEvidence(BaseModel):
+    pid: int
+    retry_count: int
     value: str
 
 
-class AgentOutput(BaseModel):
-    """Final model text payload reconstructed from serialized history."""
+class GrandchildOutput(BaseModel):
+    model_pid: int
+    tool: ToolEvidence
 
-    final_model_pid: int
-    tool_result: IsolatedLookupResult
+
+class ChildOutput(BaseModel):
+    grandchild: GrandchildOutput
+    model_pid: int
+    sibling_tools: list[ToolEvidence]
+
+
+class ParentOutput(BaseModel):
+    child: ChildOutput
+    model_pid: int
+
+
+class RuntimeEventEvidence(BaseModel):
+    label: str
+    sequence: int
 
 
 class RootTaskResult(BaseModel):
-    """Public root-task return value observed through the local CLI."""
-
-    agent_output: AgentOutput
+    controller_pid: int
+    deps_prefix: str
+    events: list[RuntimeEventEvidence]
+    output: ParentOutput
     root_pid: int
+    usage_markers: dict[str, int]
 
 
-def runtime_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-    """Drive one Pydantic AI ModelRetry from serialized message history."""
+@dataclass(kw_only=True)
+class RuntimeEffectEvent(CustomEvent, name='render_local_runtime.effect'):
+    label: str
+    sequence: int
+
+
+def _tool_returns(messages: list[ModelMessage]) -> dict[str, ToolReturnPart]:
+    """Index tool results from serialized model history by public tool name."""
+    return {part.tool_name: part for message in messages for part in message.parts if isinstance(part, ToolReturnPart)}
+
+
+def grandchild_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Run the grandchild tool once, using only serialized history for state."""
     del info
-    for message in reversed(messages):
-        for part in reversed(message.parts):
-            if isinstance(part, ToolReturnPart):
-                payload = AgentOutput(
-                    final_model_pid=os.getpid(),
-                    tool_result=IsolatedLookupResult.model_validate(part.content),
-                )
-                return ModelResponse(parts=[TextPart(payload.model_dump_json())])
-            if isinstance(part, RetryPromptPart):
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            'isolated_lookup',
-                            {'value': 'retry-value', 'model_pid': os.getpid()},
-                            tool_call_id='lookup-retry',
-                        )
-                    ]
-                )
+    returned = _tool_returns(messages)
+    if tool := returned.get('grandchild_lookup'):
+        output = GrandchildOutput(model_pid=os.getpid(), tool=ToolEvidence.model_validate(tool.content))
+        return ModelResponse(parts=[TextPart(output.model_dump_json())])
+    return ModelResponse(parts=[ToolCallPart('grandchild_lookup', {}, tool_call_id='grandchild-lookup')])
 
+
+def child_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Run sibling tools, delegate, then finish from serialized history."""
+    del info
+    returned = _tool_returns(messages)
+    if delegated := returned.get('delegate_task'):
+        output = ChildOutput(
+            grandchild=GrandchildOutput.model_validate_json(str(delegated.content)),
+            model_pid=os.getpid(),
+            sibling_tools=[
+                ToolEvidence.model_validate(returned[name].content) for name in ('child_alpha', 'child_beta')
+            ],
+        )
+        return ModelResponse(parts=[TextPart(output.model_dump_json())])
+    if {'child_alpha', 'child_beta'} <= returned.keys():
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    'delegate_task',
+                    {'agent_name': 'runtime-grandchild', 'task': 'collect grandchild evidence'},
+                    tool_call_id='child-to-grandchild',
+                )
+            ]
+        )
+    return ModelResponse(
+        parts=[
+            ToolCallPart('child_alpha', {}, tool_call_id='child-alpha'),
+            ToolCallPart('child_beta', {}, tool_call_id='child-beta'),
+        ]
+    )
+
+
+def parent_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Delegate once and finish from the child result in serialized history."""
+    del info
+    returned = _tool_returns(messages)
+    if delegated := returned.get('delegate_task'):
+        output = ParentOutput(
+            child=ChildOutput.model_validate_json(str(delegated.content)),
+            model_pid=os.getpid(),
+        )
+        return ModelResponse(parts=[TextPart(output.model_dump_json())])
     return ModelResponse(
         parts=[
             ToolCallPart(
-                'isolated_lookup',
-                {'value': 'initial-value', 'model_pid': os.getpid()},
-                tool_call_id='lookup-initial',
+                'delegate_task',
+                {'agent_name': 'runtime-child', 'task': 'collect nested process evidence'},
+                tool_call_id='parent-to-child',
             )
         ]
     )
 
 
+async def _stream_response(response: ModelResponse) -> AsyncIterator[DeltaToolCalls | str]:
+    """Convert one deterministic response to FunctionModel's streamed form."""
+    for index, part in enumerate(response.parts):
+        if isinstance(part, TextPart):
+            yield part.content
+        elif isinstance(part, ToolCallPart):
+            yield {
+                index: DeltaToolCall(
+                    name=part.tool_name,
+                    json_args=part.args_as_json_str(),
+                    tool_call_id=part.tool_call_id,
+                )
+            }
+
+
+async def stream_child_model(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls | str]:
+    """Stream the same history-driven child response."""
+    async for delta in _stream_response(child_model(messages, info)):
+        yield delta
+
+
 workflows = Workflows()
-render_workflows = RenderWorkflows[RuntimeDeps](workflows, deps_type=RuntimeDeps)
-agent = Agent[RuntimeDeps, str](
-    FunctionModel(runtime_model, model_name='local-runtime-model'),
-    name='local-runtime-agent',
+grandchild_runtime = RenderWorkflows[RuntimeDeps](workflows, deps_type=RuntimeDeps)
+grandchild = Agent[RuntimeDeps, str](
+    FunctionModel(grandchild_model, model_name='runtime-grandchild-model'),
+    name='runtime-grandchild',
     deps_type=RuntimeDeps,
     retries=1,
-    capabilities=[render_workflows],
+    capabilities=[grandchild_runtime],
 )
 
 
-@agent.tool
-async def isolated_lookup(ctx: RunContext[RuntimeDeps], value: str, model_pid: int) -> IsolatedLookupResult:
-    """Return process evidence after one Pydantic AI ModelRetry."""
+@grandchild.tool
+async def grandchild_lookup(ctx: RunContext[RuntimeDeps]) -> ToolEvidence:
+    """Retry once, then return grandchild tool-process evidence."""
     if ctx.retry == 0:
-        raise ModelRetry('retry once across the child-task boundary')
-    return IsolatedLookupResult(
-        controller_pid=ctx.deps['controller_pid'],
-        deps_prefix=ctx.deps['prefix'],
-        model_pid=model_pid,
-        model_retry_count=ctx.retry,
-        tool_pid=os.getpid(),
-        value=value,
+        raise ModelRetry(f'retry remote grandchild attempt from pid {os.getpid()}')
+    return ToolEvidence(
+        pid=os.getpid(),
+        retry_count=ctx.retry,
+        value=f'{ctx.deps["prefix"]}:grandchild',
     )
 
 
-@render_workflows.task(name='run-local-runtime-agent')
-async def run_local_runtime_agent(ctx: TaskContext, prompt: str, deps: RuntimeDeps) -> dict[str, object]:
-    """Run the public agent entry point inside a Render root task."""
+_seen_events: list[RuntimeEventEvidence] = []
+child_hooks = Hooks[RuntimeDeps]()
+
+
+@child_hooks.on.event(RuntimeEffectEvent)
+async def record_runtime_effect(ctx: RunContext[RuntimeDeps], event: RuntimeEffectEvent) -> None:
+    """Record effects only after they reach the child agent's active caller."""
     del ctx
-    result = await agent.run(prompt, deps=TypeAdapter(RuntimeDeps).validate_python(deps))
+    _seen_events.append(RuntimeEventEvidence(label=event.label, sequence=event.sequence))
+
+
+child_runtime = RenderWorkflows[RuntimeDeps](workflows, deps_type=RuntimeDeps)
+child = Agent[RuntimeDeps, str](
+    FunctionModel(child_model, stream_function=stream_child_model, model_name='runtime-child-model'),
+    name='runtime-child',
+    deps_type=RuntimeDeps,
+    capabilities=[
+        SubAgents(agents=[SubAgent(grandchild)], agent_folders=None),
+        child_hooks,
+        child_runtime,
+    ],
+)
+
+
+async def _sibling_effect(ctx: RunContext[RuntimeDeps], label: str, amount: int) -> ToolEvidence:
+    ctx.usage.incr(RunUsage(details={'runtime_remote_marker': amount, f'{label}_marker': amount}))
+    await ctx.emit(RuntimeEffectEvent(label=label, sequence=1))
+    await ctx.emit(RuntimeEffectEvent(label=label, sequence=2))
+    return ToolEvidence(pid=os.getpid(), retry_count=ctx.retry, value=f'{ctx.deps["prefix"]}:{label}')
+
+
+@child.tool
+async def child_alpha(ctx: RunContext[RuntimeDeps]) -> ToolEvidence:
+    """Emit alpha effects from one concurrent remote operation."""
+    return await _sibling_effect(ctx, 'alpha', 2)
+
+
+@child.tool
+async def child_beta(ctx: RunContext[RuntimeDeps]) -> ToolEvidence:
+    """Emit beta effects from one concurrent remote operation."""
+    return await _sibling_effect(ctx, 'beta', 5)
+
+
+parent_runtime = RenderWorkflows[RuntimeDeps](workflows, deps_type=RuntimeDeps)
+parent = Agent[RuntimeDeps, str](
+    FunctionModel(parent_model, model_name='runtime-parent-model'),
+    name='runtime-parent',
+    deps_type=RuntimeDeps,
+    capabilities=[
+        SubAgents(agents=[SubAgent(child)], agent_folders=None),
+        parent_runtime,
+    ],
+)
+
+
+@parent_runtime.task(name='run-local-runtime-agent')
+async def run_local_runtime_agent(ctx: TaskContext, prompt: str, deps: RuntimeDeps) -> dict[str, object]:
+    """Run the nested public agent entry point inside a Render root task."""
+    del ctx
+    _seen_events.clear()
+    usage = RunUsage(details={'root_marker': 3})
+    validated_deps = TypeAdapter(RuntimeDeps).validate_python(deps)
+    result = await parent.run(prompt, deps=validated_deps, usage=usage)
     payload = RootTaskResult(
-        agent_output=AgentOutput.model_validate_json(result.output),
+        controller_pid=validated_deps['controller_pid'],
+        deps_prefix=validated_deps['prefix'],
+        events=list(_seen_events),
+        output=ParentOutput.model_validate_json(result.output),
         root_pid=os.getpid(),
+        usage_markers={
+            name: usage.details.get(name, 0) for name in ('runtime_remote_marker', 'alpha_marker', 'beta_marker')
+        },
     )
     dumped = TypeAdapter(RootTaskResult).dump_python(payload, mode='json')
     return TypeAdapter(dict[str, object]).validate_python(dumped)

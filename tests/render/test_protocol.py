@@ -221,7 +221,7 @@ async def test_every_request_envelope_carries_its_version_and_operation() -> Non
     # by another, so the version and the operation it names travel with every request.
     assert context.requests
     assert all(set(request) == {'version', 'operation', 'payload'} for request in context.requests)
-    assert all(request['version'] == 1 for request in context.requests)
+    assert all(request['version'] == 2 for request in context.requests)
     assert all(request['operation'] == 'support__model.request' for request in context.requests)
 
 
@@ -234,7 +234,7 @@ async def test_successful_result_envelope_carries_its_version_and_payload() -> N
 
     assert context.results
     assert all(set(result) == {'version', 'status', 'payload'} for result in context.results)
-    assert all(result['version'] == 1 for result in context.results)
+    assert all(result['version'] == 2 for result in context.results)
     assert all(result['status'] == 'ok' for result in context.results)
 
 
@@ -245,7 +245,11 @@ async def test_successful_result_envelope_carries_its_version_and_payload() -> N
         pytest.param(_set('operation', 'support__model.compact_messages'), 'names operation', id='wrong-operation'),
         pytest.param(_drop('payload'), r"missing \['payload'\]", id='missing-key'),
         pytest.param(_set('surprise', True), r"unexpected \['surprise'\]", id='extra-key'),
-        pytest.param(_set('version', 2), 'protocol version 2 is unsupported', id='unsupported-version'),
+        pytest.param(
+            _set('version', 3),
+            r'protocol version 3 is unsupported; expected one of \[1, 2\]',
+            id='unsupported-version',
+        ),
         pytest.param(_set('payload', 5), 'Operation payload must be a JSON object', id='payload-not-an-object'),
     ],
 )
@@ -267,7 +271,11 @@ async def test_malformed_request_completes_the_child_with_an_invalid_request_err
 @pytest.mark.parametrize(
     ('tamper', 'message'),
     [
-        pytest.param(_set('version', 2), 'protocol version 2 is unsupported', id='unsupported-version'),
+        pytest.param(
+            _set('version', 3),
+            r'protocol version 3 is unsupported; expected one of \[1, 2\]',
+            id='unsupported-version',
+        ),
         pytest.param(_set('status', 'finished'), "unknown status 'finished'", id='unknown-status'),
         pytest.param(_drop('payload'), r"missing \['payload'\]", id='missing-key'),
         pytest.param(_set('surprise', True), r"unexpected \['surprise'\]", id='extra-key'),

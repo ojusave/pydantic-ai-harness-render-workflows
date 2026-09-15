@@ -24,7 +24,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import InstructionPart
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
-from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, FunctionToolset, WrapperToolset
 
 try:
     from render import Options, Retry, TaskContext, Workflows
@@ -39,6 +39,7 @@ from ._compat import (
     CapabilityMethodDeclaration,
     RenderRunContextCodec,
     ToolsetCallToolParams,
+    function_tool_original_name,
     prepare_function_call_params,
     reject_unidentified_operation_capabilities,
 )
@@ -140,11 +141,11 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
             capability_options: Options for tasks generated from other capabilities'
                 `@durable_operation` methods.
             resolve_tool_options: Optional resolver for toolset registration options and
-                function-tool opt-out. Registration calls receive `tool=None`; inspect the
-                operation's toolset ID to return task options. `None` keeps `tool_options`,
-                and `False` for a concrete function tool executes it inline. Render fixes task
-                options at registration, so returning different `Options` later raises a
-                `UserError` rather than silently ignoring them.
+                function-tool opt-out. The framework asks for a toolset default with
+                `tool=None`; each statically known function tool is then resolved with its
+                concrete tool and name. `None` keeps `tool_options`, and `False` executes that
+                function tool inline. Render fixes task options at registration, so returning
+                different `Options` later raises a `UserError` rather than silently ignoring them.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
         self.app = app
@@ -156,7 +157,8 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         ) -> Options | Literal[False]:
             if resolve_tool_options is None:
                 return base_tool_options
-            resolved = resolve_tool_options(operation_id, tool, tool_name)
+            static_name = function_tool_original_name(tool) if tool is not None else None
+            resolved = resolve_tool_options(operation_id, tool, static_name or tool_name)
             # Binding asks for the task definition's options before a concrete
             # tool is known. `False` remains a per-invocation function-tool
             # opt-out, so it cannot suppress registration of the shared task.
@@ -181,9 +183,10 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         )
         self._operation_backend: RenderOperationBackend[AgentDepsT] | None = None
         self._context_codec: RenderRunContextCodec[Any] | None = None
-        # BaseDurabilityCapability binds a shallow copy. The original task decorator and the
-        # bound runtime intentionally share this token while remaining isolated from other apps.
-        self._owner_token = object()
+        self._inline_toolsets: frozenset[int] = frozenset()
+        # Task context belongs to the Workflow app. Explicitly configured child agents using
+        # another RenderWorkflows instance for the same app can therefore start nested tasks.
+        self._owner_token = app
 
     @property
     def current_task_context(self) -> TaskContext | None:
@@ -296,7 +299,7 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         # Render task names are persisted workflow identity, so every leaf is named before
         # the codec, the operation backend, and the event operation below start registering
         # tasks: a name settled later would be a name nothing can go back and change.
-        prepare_capability_toolset_ids(agent.toolsets)
+        self._inline_toolsets = prepare_capability_toolset_ids(agent.toolsets)
         # Pydantic AI reaches the same check while registering capability operations, by
         # which point this app is already holding tasks that nothing can unregister.
         reject_unidentified_operation_capabilities(agent.root_capability)
@@ -318,6 +321,11 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         if self._event_stream_handler is not None:
             self._bound_event_operation = self._bind_event_operation(self._operation_backend)
         super()._bind_to_agent(agent)
+
+    def _wrap_leaf_toolset(self, ts: AbstractToolset[AgentDepsT]) -> WrapperToolset[AgentDepsT] | None:
+        if id(ts) in self._inline_toolsets:
+            return None
+        return super()._wrap_leaf_toolset(ts)
 
     def get_durable_operation_backend(self) -> DurableOperationBackend[Options | None]:
         backend = self._operation_backend
