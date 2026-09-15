@@ -17,6 +17,9 @@ from typing import ParamSpec, TypeVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+pytest.importorskip('render')
+
 from render.workflows import TaskContext, TaskDefinition
 
 P = ParamSpec('P')

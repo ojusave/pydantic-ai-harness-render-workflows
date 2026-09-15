@@ -9,11 +9,12 @@ from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from render.workflows import TaskContext, Workflows
+from typing_extensions import TypedDict
 
 from pydantic_ai_harness import RenderWorkflows
 
 
-class RuntimeDeps(BaseModel):
+class RuntimeDeps(TypedDict):
     """Serializable values transported to isolated operation tasks."""
 
     prefix: str
@@ -95,8 +96,8 @@ async def isolated_lookup(ctx: RunContext[RuntimeDeps], value: str, model_pid: i
     if ctx.retry == 0:
         raise ModelRetry('retry once across the child-task boundary')
     return IsolatedLookupResult(
-        controller_pid=ctx.deps.controller_pid,
-        deps_prefix=ctx.deps.prefix,
+        controller_pid=ctx.deps['controller_pid'],
+        deps_prefix=ctx.deps['prefix'],
         model_pid=model_pid,
         model_retry_count=ctx.retry,
         tool_pid=os.getpid(),
@@ -108,7 +109,7 @@ async def isolated_lookup(ctx: RunContext[RuntimeDeps], value: str, model_pid: i
 async def run_local_runtime_agent(ctx: TaskContext, prompt: str, deps: RuntimeDeps) -> dict[str, object]:
     """Run the public agent entry point inside a Render root task."""
     del ctx
-    result = await agent.run(prompt, deps=RuntimeDeps.model_validate(deps))
+    result = await agent.run(prompt, deps=TypeAdapter(RuntimeDeps).validate_python(deps))
     payload = RootTaskResult(
         agent_output=AgentOutput.model_validate_json(result.output),
         root_pid=os.getpid(),

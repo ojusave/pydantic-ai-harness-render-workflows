@@ -38,6 +38,8 @@ except ImportError as _import_error:  # pragma: no cover
 from ._compat import (
     CapabilityMethodDeclaration,
     RenderRunContextCodec,
+    ToolsetCallToolParams,
+    prepare_function_call_params,
     reject_unidentified_operation_capabilities,
 )
 from ._context import activate_task_context, current_task_context
@@ -137,10 +139,12 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
             event_options: Options for event handler tasks.
             capability_options: Options for tasks generated from other capabilities'
                 `@durable_operation` methods.
-            resolve_tool_options: Optional resolver for a tool-specific opt-out. Returning
-                `None` keeps `tool_options`, and `False` executes a supported function tool
-                inline. Render fixes task options at registration, so returning different
-                `Options` later raises a `UserError` rather than silently ignoring them.
+            resolve_tool_options: Optional resolver for toolset registration options and
+                function-tool opt-out. Registration calls receive `tool=None`; inspect the
+                operation's toolset ID to return task options. `None` keeps `tool_options`,
+                and `False` for a concrete function tool executes it inline. Render fixes task
+                options at registration, so returning different `Options` later raises a
+                `UserError` rather than silently ignoring them.
         """
         super().__init__(models=models, event_stream_handler=event_stream_handler, name=name)
         self.app = app
@@ -150,9 +154,14 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         def resolve_options(
             operation_id: DurableOperationId, tool: object | None, tool_name: str
         ) -> Options | Literal[False]:
-            if tool is None or resolve_tool_options is None:
+            if resolve_tool_options is None:
                 return base_tool_options
             resolved = resolve_tool_options(operation_id, tool, tool_name)
+            # Binding asks for the task definition's options before a concrete
+            # tool is known. `False` remains a per-invocation function-tool
+            # opt-out, so it cannot suppress registration of the shared task.
+            if tool is None and resolved is False:
+                return base_tool_options
             if resolved is False and (
                 not isinstance(operation_id, ToolsetCallToolId | ToolsetValidateToolArgumentsId)
                 or operation_id.toolset_kind != 'function'
@@ -326,6 +335,17 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         """Resolve a child task's model from this worker's model registry."""
         registry_key = model_id or 'default'
         return self._models_by_id.get(registry_key)
+
+    async def _prepare_function_call_params(
+        self,
+        toolset: FunctionToolset[AgentDepsT],
+        params: ToolsetCallToolParams,
+    ) -> ToolsetCallToolParams:
+        """Revalidate JSON-decoded arguments against the worker-local tool."""
+        agent = self._agent
+        if agent is None:  # pragma: no cover - binding always supplies the agent
+            raise UserError('`RenderWorkflows` must be bound before a function tool can run.')
+        return await prepare_function_call_params(agent, toolset, params)
 
     def _capability_operation_parameter_transport(
         self, declaration: CapabilityMethodDeclaration

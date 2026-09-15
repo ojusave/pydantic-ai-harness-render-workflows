@@ -92,6 +92,7 @@ __all__ = (
     'model_settings_from_json',
     'model_settings_to_json',
     'normalize_json_value',
+    'prepare_function_call_params',
     'reject_unidentified_operation_capabilities',
     'resolve_function_tool_for_definition',
     'resolve_mcp_tool_for_definition',
@@ -230,6 +231,28 @@ def load_operation_params(
         raise TypeError(f'{type(transport).__name__} does not accept the Render JSON-object wire.')
     json_transport: RenderJsonTransport[ParamsT] = transport
     return json_transport.load(payload, runtime=runtime)
+
+
+async def prepare_function_call_params(
+    agent: AbstractAgent[ToolDepsT, Any],
+    toolset: FunctionToolset[ToolDepsT],
+    params: ToolsetCallToolParams,
+) -> ToolsetCallToolParams:
+    """Restore typed function arguments after the Render JSON round trip."""
+    tool = params.tool
+    if tool is None:
+        try:
+            tool = (await toolset.get_tools(params.ctx))[params.name]
+        except KeyError as exc:
+            raise UserError(
+                f'Tool {params.name!r} not found in toolset {toolset.id!r}. '
+                'Removing or renaming tools during an agent run is not supported with Render Workflows.'
+            ) from exc
+    args = tool.args_validator.validate_python(
+        params.tool_args,
+        context=validation_context_from_agent(agent)(params.ctx),
+    )
+    return ToolsetCallToolParams(params.name, tool_args=args, ctx=params.ctx, tool=tool)
 
 
 def load_json_type(type_form: type[T], payload: object) -> T:
@@ -553,9 +576,9 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
             raise TypeError('Render run-context payload requires `deps`.')
 
         context = load_json_object(to_json_object(payload['context']))
+        # The codec validates against the complete type form. A second `isinstance`
+        # check would reject valid forms such as `dict[str, str]` and `TypedDict`.
         deps_value = JSON_CODEC.load(self._deps_type, payload['deps'])
-        if not isinstance(deps_value, self._deps_type):
-            raise TypeError(f'Expected dependencies of type {self._deps_type.__name__}.')
         ctx = self._run_context_type.deserialize_run_context(
             context,
             deps=deps_value,

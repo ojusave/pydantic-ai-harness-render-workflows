@@ -173,9 +173,11 @@ Configure the workflow entry task separately, for example `@workflows.task(timeo
 
 Render fixes task options at registration. One call task definition serves every tool in its toolset, so retry, timeout, and plan cannot vary per invocation within a toolset. Returning different `Options` from the resolver raises `UserError`. Returning `None` keeps `tool_options`.
 
-To give static function tools distinct definitions and distinct options, put each one in its own named `FunctionToolset`: the split comes from how you group the tools, not automatically per tool inside a single toolset.
+The resolver first runs while each task definition is registered, with `tool=None` and `tool_name=''`. Inspect `operation_id.toolset_id` there to select options for a named toolset. It runs again for an invocation with the concrete tool and name; any returned `Options` must equal the options registered for that toolset.
 
-Returning `False` runs a supported static function tool inside the workflow entry task, with no child task run of its own, and so no independent retry, timeout, plan, or task record. It is rejected for MCP and dynamic tools.
+To give static function tools distinct definitions and distinct options, put each one in its own named `FunctionToolset` and resolve options from `operation_id.toolset_id`. Per-tool options remain unsupported when several tools share one toolset because they also share one Render task definition.
+
+Returning `False` for a concrete function-tool invocation runs that tool inside the workflow entry task, with no child task run of its own, and so no independent retry, timeout, plan, or task record. A registration-time `False` does not suppress the shared task definition. `False` is rejected for MCP and dynamic tool invocations.
 
 ## JSON and dependency boundary
 
