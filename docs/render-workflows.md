@@ -133,34 +133,15 @@ A child task may run in a fresh process. The capability sends one versioned JSON
 
 Treat the complete agent run and tool side effects as at least once. A retry of an individual child task can repeat its external side effect if interruption occurs before Render records the result. A retry of the workflow entry task starts `agent.run(...)` again and can repeat model requests and tool calls that completed during the earlier attempt. The current Render SDK does not let this integration assign stable idempotency keys to child task calls or resume the Pydantic agent loop from a checkpoint.
 
-## Capability and task-lineage contract
+## Capability toolsets, models, and task lineage
 
-Capabilities that contribute a leaf toolset must propagate their stable
-capability `id` to that toolset. Render persists the generated task name, so a
-missing ID prevents registration and changing an ID can strand in-flight runs.
-Tests for a capability that wraps a toolset should assert both the leaf ID and
-the exact generated Render task names.
+Render identifies a leaf toolset's tasks by its `id`, and a capability that builds its own toolset leaves that toolset unnamed. Binding names each unnamed capability-contributed leaf after the capability that owns it, so `SubAgents(id='sub_agents')` registers `<agent>__function_toolset__sub_agents.call_tool`. A toolset that came with an `id` keeps it, an `id` another toolset already uses gets a numbered variant, and an unnamed leaf under a capability with no `id` still raises the error that says how to name it. Task names are persisted journal data, so changing a capability's `id` strands runs recorded under the old name.
 
-Model objects do not cross a Render task boundary. A delegated agent with its
-own model keeps that model without reading the reconstructed parent context. A
-model-less delegate may inherit the parent model in-process, but durable
-delegates must configure an explicit model or select one from the `SubAgents`
-model menu. Do not serialize provider clients or credentials to imitate model
-inheritance.
+Model instances do not cross the boundary, but their ids do. A child task resolves the run's model id against the models registered in its own process (the agent's default model plus the `models={...}` entries) and reports that instance as `ctx.model`, which is what lets a tool, a delegated sub-agent, or another capability read the model inside a child task. It resolves to the plain model rather than the workflow side's durable wrapper, so that work stays in the task already running it. A plain-string default that each run resolves for itself has no registered instance, and `ctx.model` remains unavailable in a child task.
 
-Render owns task-run lineage. Harness operations spawn children only through
-`TaskContext.run()` and cannot assign `parentTaskRunId` or `rootTaskRunId`.
-Consumers that display a run graph should prefer a populated
-`rootTaskRunId`, retain `parentTaskRunId` to calculate depth, and paginate every
-task-run page. If a platform version leaves the root field empty, scope the
-listing to the Workflow and walk parent links as a compatibility fallback.
+Render owns task-run lineage. This integration spawns children through `TaskContext.run()` and cannot assign `parentTaskRunId` or `rootTaskRunId` itself. Code that draws a run graph should read `rootTaskRunId` where the platform populates it, keep `parentTaskRunId` to work out depth, and page through every task-run listing. Where the root field comes back empty, scope the listing to the Workflow and walk parent links instead.
 
-Regression coverage should have two layers:
-
-- deterministic harness tests for leaf IDs, task registration, JSON transport,
-  and delegation with an explicit child model;
-- an opt-in `render workflows dev` smoke test that starts a root task and
-  verifies model and tool child tasks across the real process boundary.
+Coverage for this area works in two layers: deterministic tests for toolset ids, task registration, and the JSON boundary, then an opt-in `render workflows dev` run that starts a root task and checks the model and tool child tasks across a real process boundary.
 
 ## Streaming and cancellation
 

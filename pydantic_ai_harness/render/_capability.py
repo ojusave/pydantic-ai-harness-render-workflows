@@ -43,6 +43,7 @@ from ._compat import (
 )
 from ._context import activate_task_context, current_task_context
 from ._operation_backend import RenderOperationBackend
+from ._toolset_ids import name_capability_toolsets
 from ._transports import (
     RenderCancelTransport,
     RenderCapabilityOperationTransport,
@@ -241,7 +242,11 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
     def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
         if self._deps_type is None:
             self._deps_type = agent.deps_type
-        self._context_codec = RenderRunContextCodec(deps_type=self._deps_type, agent=agent)
+        # Before registration reads the ids: a capability's toolset is named after the capability.
+        name_capability_toolsets(agent.toolsets)
+        self._context_codec = RenderRunContextCodec(
+            deps_type=self._deps_type, agent=agent, resolve_model=self._model_for_task
+        )
         self._operation_backend = RenderOperationBackend(
             self.app,
             runtime=self,  # pyright: ignore[reportArgumentType]
@@ -261,6 +266,10 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         codec = self._context_codec
         assert codec is not None
         return codec
+
+    def _model_for_task(self, model_id: str | None) -> Model | None:
+        """The registered model a child task's run context should report, if this process has it."""
+        return self._models_by_id.get(model_id if model_id is not None else 'default')
 
     def _capability_operation_parameter_transport(
         self, declaration: CapabilityMethodDeclaration

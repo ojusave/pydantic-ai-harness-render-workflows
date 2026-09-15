@@ -291,11 +291,46 @@ async def test_delegation_to_a_sub_agent_with_its_own_model_runs_in_a_render_tas
     assert inspect.isawaitable(pending_result)
     result = await pending_result
 
-    # The delegate tool runs inside a child task, where the run context is a projection of
-    # the parent's and has no readable `model`. A sub-agent with its own model must not need
-    # one: reading it there would fail the delegation outright.
+    # The delegate tool runs inside a child task, against a projection of the parent's run
+    # context. Delegation reads the parent model from it, so a projection that cannot answer
+    # for the model fails the delegation outright.
     assert result == 'all done'
     assert context.task_names.count('support__function_toolset__sub_agents.call_tool') == 1
+
+
+@pytest.mark.anyio
+async def test_a_tool_in_a_child_task_reads_the_run_model_from_its_own_process() -> None:
+    model = TestModel(call_tools=['inspect_model'])
+    seen: list[object] = []
+
+    async def inspect_model(ctx: RunContext[None]) -> str:
+        seen.append(ctx.model)
+        return 'noted'
+
+    workflows = Workflows()
+    render_workflows = RenderWorkflows[None](workflows, deps_type=type(None))
+    agent = Agent[None, str](
+        model,
+        name='support',
+        deps_type=type(None),
+        tools=[inspect_model],
+        capabilities=[render_workflows],
+    )
+
+    @render_workflows.task
+    async def run_agent(ctx: TaskContext, prompt: str) -> str:
+        del ctx
+        return (await agent.run(prompt)).output
+
+    pending_result = run_agent.func(RecordingTaskContext(), 'look')
+    assert inspect.isawaitable(pending_result)
+    await pending_result
+
+    # The model instance itself never crossed the boundary: the child task resolved the run's
+    # model id against the registry the agent module built in this process. It is the plain
+    # model, not the durable wrapper the workflow side holds, so the tool's own model calls
+    # stay inside the task it is already running in.
+    assert seen == [model]
 
 
 @pytest.mark.anyio

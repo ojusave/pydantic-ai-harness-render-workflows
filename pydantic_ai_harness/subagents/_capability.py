@@ -183,10 +183,6 @@ class SubAgents(AbstractCapability[AgentDepsT]):
     Declaring the id here is what makes two of them merge instead, unioning their rosters -- which
     is what lets a packaged harness that delegates compose with another that does the same.
 
-    It also names the delegate toolset. A durable execution engine identifies a leaf toolset by
-    its `id` and refuses to register one without it, so setting this to `None` makes the
-    capability unusable under durable execution.
-
     Keyword-only on the field rather than through a `KW_ONLY` marker: a marker applies to every
     field after it, which would take `tool_retries` and `contain_errors` off the positional
     contract they already have.
@@ -374,7 +370,6 @@ class SubAgents(AbstractCapability[AgentDepsT]):
             contain_errors=self.contain_errors,
             call_counts=self._call_counts,
             models=self._menu,
-            id=self.id,
         )
 
     @classmethod

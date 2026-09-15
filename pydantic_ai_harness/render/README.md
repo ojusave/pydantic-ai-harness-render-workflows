@@ -75,6 +75,8 @@ uv run render workflows dev -- render-workflows app:app
 
 Pass executable tools and toolsets when constructing the agent. Later or per-run executable toolsets bypass pre-registration and are rejected inside a Render workflow. Give the agent and each toolset stable, unique names because generated task names are persisted workflow identity.
 
+A toolset that a capability builds for itself takes its name from that capability's `id`, since nothing else can name it: `SubAgents(id='sub_agents')` registers `<agent>__function_toolset__sub_agents.call_tool`. Renaming the capability is therefore a task rename.
+
 ## Generated tasks
 
 The capability registers the operation types used by the agent:
@@ -130,7 +132,7 @@ A child task may run in a fresh process. The capability sends one versioned JSON
 
 - Dependencies must round-trip through Pydantic's JSON codec. `deps_type` defaults to the agent's dependency type.
 - Messages, model settings, metadata, tool definitions and arguments, events, capability arguments, and results that cross the boundary must be JSON encodable.
-- Model instances do not cross. The default model and entries in `models={...}` are registered by ID and resolved in the child task.
+- Model instances do not cross. The default model and entries in `models={...}` are registered by ID and resolved in the child task, which is also where `ctx.model` gets the instance it reports.
 - Render task arguments have a 4 MiB limit. The capability checks the final JSON envelope before dispatch.
 - Live in-process objects are unavailable unless the reconstructed run context explicitly supports them.
 

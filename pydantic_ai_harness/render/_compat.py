@@ -48,18 +48,20 @@ from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameter
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import ToolsetTool
+from pydantic_ai.toolsets._capability_owned import CapabilityOwnedToolset
 from pydantic_ai.toolsets.function import FunctionToolsetTool
 from pydantic_ai.usage import RunUsage, UsageLimits
 from typing_extensions import TypeVar as TypeVarExtensions
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 __all__ = (
     'BoundDurableOperation',
     'CallToolResult',
     'CapabilityMethodDeclaration',
     'CapabilityOperationParams',
+    'CapabilityOwnedToolset',
     'DynamicToolsResult',
     'DynamicToolsetCallToolParams',
     'DurableOperation',
@@ -331,6 +333,10 @@ class RenderRunContext(RunContext[AgentDepsT]):
         return {
             'run_id': ctx.run_id,
             'conversation_id': ctx.conversation_id,
+            # The model itself cannot cross the boundary, but its id says which of the
+            # process's registered models the child task is running on. Carried under the
+            # field name so `model_id` reads it back through its own property.
+            '_model_id': ctx.model_id,
             'metadata': ctx.metadata,
             'retries': ctx.retries,
             'tool_call_id': ctx.tool_call_id,
@@ -355,9 +361,17 @@ class RenderRunContext(RunContext[AgentDepsT]):
         }
 
     @classmethod
-    def deserialize_run_context(cls, ctx: Mapping[str, Any], deps: AgentDepsT) -> RenderRunContext[AgentDepsT]:
-        """Rebuild a restricted context from its JSON projection."""
-        return cls(**ctx, deps=deps)
+    def deserialize_run_context(
+        cls, ctx: Mapping[str, Any], deps: AgentDepsT, model: Model | None = None
+    ) -> RenderRunContext[AgentDepsT]:
+        """Rebuild a restricted context from its JSON projection.
+
+        `model` is never part of the projection -- a `Model` holds a provider client and does
+        not serialize. The caller resolves it in this process and passes the instance, which
+        makes it readable here like any other carried field.
+        """
+        carried = {**ctx, 'model': model} if model is not None else ctx
+        return cls(**carried, deps=deps)
 
 
 class RenderRunContextCodec(Generic[AgentDepsT]):
@@ -368,10 +382,12 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
         *,
         deps_type: type[AgentDepsT],
         agent: AbstractAgent[AgentDepsT, Any] | None,
+        resolve_model: Callable[[str | None], Model | None] | None = None,
         run_context_type: type[RenderRunContext[Any]] = RenderRunContext,
     ) -> None:
         self._deps_type = deps_type
         self._agent = agent
+        self._resolve_model = resolve_model
         self._run_context_type = run_context_type
 
     def dump(self, ctx: RunContext[AgentDepsT]) -> JSONObject:
@@ -397,10 +413,26 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
         deps_value = JSON_CODEC.load(self._deps_type, payload['deps'])
         if not isinstance(deps_value, self._deps_type):
             raise TypeError(f'Expected dependencies of type {self._deps_type.__name__}.')
-        ctx = self._run_context_type.deserialize_run_context(context, deps=deps_value)
+        ctx = self._run_context_type.deserialize_run_context(context, deps=deps_value, model=self._model_for(context))
         if self._agent is not None:
             ctx.__dict__['agent'] = self._agent
             ctx.__dict__['root_capability'] = self._agent.root_capability
             ctx.__dict__['validation_context'] = validation_context_from_agent(self._agent)(ctx)
         ctx.__dict__['pending_messages'] = EnqueueGuard(enqueue_not_supported_message('task', 'workflow'))
         return ctx
+
+    def _model_for(self, context: Mapping[str, Any]) -> Model | None:
+        """The run's model as this process knows it, from the model id the projection carries.
+
+        The worker imports the same agent module, so the instance is already here and only its
+        id has to travel. Without this, anything that reads `ctx.model` inside a child task
+        fails: delegating to a sub-agent, summarizing oversized tool output, or a user's own
+        tool. What resolves is the plain model rather than the workflow side's durable wrapper,
+        so work a child task does stays in the task it is already running in.
+
+        An id with no registered instance -- a plain-string default that each run resolves for
+        itself -- leaves `model` guarded, so the restriction error still explains itself.
+        """
+        if self._resolve_model is None:
+            return None
+        return self._resolve_model(cast('str | None', context.get('_model_id')))

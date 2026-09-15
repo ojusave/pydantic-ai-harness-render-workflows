@@ -24,7 +24,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import AgentDepsT, RunContext
 from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai.usage import RunUsage, UsageLimits
+from pydantic_ai.usage import UsageLimits
 
 from pydantic_ai_harness.subagents import SubAgent, SubAgents, SubAgentToolset
 
@@ -204,96 +204,6 @@ class TestToolset:
         toolset = SubAgents(agents=[SubAgent(agent)], tool_retries=3).get_toolset()
         assert isinstance(toolset, SubAgentToolset)
         assert toolset.tools['delegate_task'].max_retries == 3
-
-
-class TestToolsetId:
-    """The delegate toolset carries the capability's `id`.
-
-    A durable engine identifies a leaf toolset by its `id` and refuses to register one without
-    it, so the capability's own id has to reach the toolset for the capability to be usable
-    under durable execution at all.
-    """
-
-    def test_toolset_id_defaults_to_the_capability_id(self) -> None:
-        agent = Agent(TestModel(), name='x')
-        toolset = SubAgents(agents=[SubAgent(agent)]).get_toolset()
-        assert isinstance(toolset, SubAgentToolset)
-        assert toolset.id == 'sub_agents'
-
-    def test_toolset_id_follows_a_custom_capability_id(self) -> None:
-        agent = Agent(TestModel(), name='x')
-        toolset = SubAgents(agents=[SubAgent(agent)], id='delegates').get_toolset()
-        assert isinstance(toolset, SubAgentToolset)
-        assert toolset.id == 'delegates'
-
-    def test_toolset_id_is_unset_when_the_capability_has_none(self) -> None:
-        agent = Agent(TestModel(), name='x')
-        toolset = SubAgents(agents=[SubAgent(agent)], id=None).get_toolset()
-        assert isinstance(toolset, SubAgentToolset)
-        assert toolset.id is None
-
-    def test_toolset_takes_an_id_when_constructed_directly(self) -> None:
-        toolset = _delegate_toolset(SubAgent(Agent(TestModel(), name='x')), id='direct')
-        assert toolset.id == 'direct'
-
-
-class _ModellessRunContext(RunContext[object]):
-    """A run context that refuses to answer `model`.
-
-    Stands in for a durable worker's reconstruction of the parent context: the parent's model
-    is a live object that does not cross a task boundary, so the projection the child task
-    receives has no `model` at all and raises when something reads it.
-    """
-
-    def __getattribute__(self, name: str) -> Any:
-        if name == 'model':
-            raise UserError("'model' is not available on this run context.")
-        return super().__getattribute__(name)
-
-
-class TestModelResolution:
-    async def test_delegate_with_its_own_model_never_reads_the_parent_model(self) -> None:
-        toolset = _delegate_toolset(SubAgent(Agent(TestModel(custom_output_text='WORKER RESULT'), name='worker')))
-
-        output = await toolset.delegate_task(_modelless_ctx(), 'worker', 'do it')
-
-        assert output == 'WORKER RESULT'
-
-    async def test_delegate_without_a_model_still_needs_the_parent_model(self) -> None:
-        # The other half of the contract: a model-less delegate inherits the parent's model,
-        # so it has to read `ctx.model` and cannot paper over a context that has none.
-        toolset = _delegate_toolset(SubAgent(Agent[object, str](None, name='worker')))
-
-        with pytest.raises(UserError, match="'model' is not available"):
-            await toolset.delegate_task(_modelless_ctx(), 'worker', 'do it')
-
-
-def _delegate_toolset(*agents: SubAgent[object], id: str | None = None) -> SubAgentToolset[object]:
-    """A delegate toolset over `agents`, for calling `delegate_task` without a parent run."""
-    return SubAgentToolset[object](
-        agents={sub_agent.resolved_name or '': sub_agent for sub_agent in agents},
-        forward_usage=True,
-        inherit_tools=False,
-        shared_capabilities=[],
-        event_stream_handler=None,
-        tool_name='delegate_task',
-        tool_retries=None,
-        contain_errors=False,
-        call_counts={},
-        id=id,
-    )
-
-
-def _modelless_ctx() -> RunContext[object]:
-    """A minimal run context for calling `delegate_task` directly, with no readable model."""
-    return _ModellessRunContext(
-        deps=None,
-        model=TestModel(),
-        usage=RunUsage(),
-        prompt=None,
-        messages=[],
-        run_step=1,
-    )
 
 
 class TestDelegation:

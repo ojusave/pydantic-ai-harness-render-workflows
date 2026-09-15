@@ -201,7 +201,7 @@ class ToolOutputLimits(AbstractCapability[AgentDepsT]):
             """
             return await _read_slice(store, handle, offset, limit, from_end, pattern)
 
-        return FunctionToolset([read_tool_result], id=self.id)
+        return FunctionToolset([read_tool_result])
 
     # --- reduction ---
 

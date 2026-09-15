@@ -211,9 +211,8 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
         contain_errors: bool,
         call_counts: dict[str, dict[str, int]],
         models: Mapping[str, ModelOption] | None = None,
-        id: str | None = None,
     ) -> None:
-        super().__init__(id=id)
+        super().__init__()
         self._agents: dict[str, SubAgent[AgentDepsT]] = dict(agents)
         self._forward_usage = forward_usage
         self._inherit_tools = inherit_tools
@@ -346,33 +345,6 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             )
         return await self._run_delegation(ctx, agent_name, sub_agent, task=task, key=key)
 
-    def _resolve_model(
-        self, ctx: RunContext[AgentDepsT], sub_agent: SubAgent[AgentDepsT], key: str | None
-    ) -> tuple[Model | KnownModelName | str | None, ModelSettings | None]:
-        """The model one delegation runs on and the settings it runs with.
-
-        A selected menu option decides both. Without one, a sub-agent with no model of its
-        own (e.g. one loaded from disk) inherits the parent run's model, and one that brought
-        its own keeps it -- expressed as `None`, which leaves `agent.run` on the agent's model.
-        """
-        if key is not None:
-            option = self._models[key]
-            return option.model, option.settings
-        if sub_agent.agent.model is not None:
-            # Answered without reading `ctx.model`: the child already has a model, so the
-            # parent's is irrelevant, and a run context that cannot produce one (a durable
-            # worker reconstructing the parent context from its serialized projection) must
-            # not turn an explicitly-modelled delegation into an error.
-            return None, None
-        # `ctx.model` is an `AbstractModel`; only a request-response `Model` can drive a
-        # sub-agent run. When the parent run uses something else (a realtime model), fall
-        # back to `None` so the sub-agent uses its own default rather than being handed a
-        # model it cannot run with. Bind to a local, then `cast` to recover `Model[Any]`
-        # from the generic `Model` (which `isinstance` narrows to `Model[Unknown]`),
-        # mirroring core's own `reinject_system_prompt` idiom.
-        ctx_model = ctx.model
-        return (cast('Model[Any]', ctx_model) if isinstance(ctx_model, Model) else None), None
-
     async def _run_delegation(
         self,
         ctx: RunContext[AgentDepsT],
@@ -408,7 +380,29 @@ class SubAgentToolset(FunctionToolset[AgentDepsT]):
             child_usage = None if self._forward_usage else RunUsage()
             usage_limits = None
 
-        run_model, settings = self._resolve_model(ctx, sub_agent, key)
+        # A selected menu option decides the model and how it runs. Without one, a
+        # sub-agent with no model of its own (e.g. one loaded from disk) inherits the
+        # parent run's model, and one that brought its own keeps it.
+        run_model: Model | KnownModelName | str | None
+        settings: ModelSettings | None
+        if key is not None:
+            option = self._models[key]
+            run_model = option.model
+            settings = option.settings
+        else:
+            # `ctx.model` is an `AbstractModel`; only a request-response `Model` can drive a
+            # sub-agent run. When the parent run uses something else (a realtime model), fall
+            # back to `None` so the sub-agent uses its own default rather than being handed a
+            # model it cannot run with. Bind to a local, then `cast` to recover `Model[Any]`
+            # from the generic `Model` (which `isinstance` narrows to `Model[Unknown]`),
+            # mirroring core's own `reinject_system_prompt` idiom.
+            ctx_model = ctx.model
+            run_model = (
+                cast('Model[Any]', ctx_model)
+                if sub_agent.agent.model is None and isinstance(ctx_model, Model)
+                else None
+            )
+            settings = None
         run = sub_agent.agent.run(
             task,
             deps=ctx.deps,

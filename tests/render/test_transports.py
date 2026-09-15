@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pytest
 from pydantic_ai import Agent, FunctionToolset, RunContext
 from pydantic_ai.capabilities import AbstractCapability, durable_operation
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, PartStartEvent, TextPart, UserPromptPart
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.test import TestModel
@@ -69,12 +70,13 @@ def _json_round_trip(payload: JSONObject) -> JSONObject:
     return to_json_object(json.loads(json.dumps(payload)))
 
 
-def _run_context() -> tuple[RunContext[Deps], RenderRunContextCodec[Deps]]:
+def _run_context(*, model_id: str | None = None) -> tuple[RunContext[Deps], RenderRunContextCodec[Deps]]:
     model = TestModel()
     agent = Agent(model, name='transport-test', deps_type=Deps)
     ctx = RunContext(
         deps=Deps(tenant='acme'),
         model=model,
+        _model_id=model_id,
         usage=RunUsage(requests=2, input_tokens=10),
         usage_limits=UsageLimits(request_limit=8),
         agent=agent,
@@ -272,6 +274,33 @@ class TestRenderTransports:
         assert loaded.arguments == {'value': 'hello'}
         assert loaded.model_id == 'tenant-model'
         assert loaded.run_context.deps == Deps(tenant='acme')
+
+    def test_child_context_reports_the_model_registered_under_the_run_model_id(self) -> None:
+        ctx, _ = _run_context(model_id='tenant-model')
+        replacement = TestModel()
+        codec = RenderRunContextCodec(
+            deps_type=Deps,
+            agent=ctx.agent,
+            resolve_model=lambda model_id: replacement if model_id == 'tenant-model' else None,
+        )
+        transport = RenderGetToolsTransport(codec, result_type=dict[str, ToolDefinition])
+
+        loaded = transport.load(_json_round_trip(transport.dump(ToolsetGetToolsParams(ctx))), runtime=object())
+
+        assert loaded.ctx.model_id == 'tenant-model'
+        assert loaded.ctx.model is replacement
+
+    def test_child_context_keeps_the_model_guarded_when_the_id_resolves_to_nothing(self) -> None:
+        ctx, _ = _run_context()
+        codec = RenderRunContextCodec(deps_type=Deps, agent=ctx.agent, resolve_model=lambda _model_id: None)
+        transport = RenderGetToolsTransport(codec, result_type=dict[str, ToolDefinition])
+
+        loaded = transport.load(_json_round_trip(transport.dump(ToolsetGetToolsParams(ctx))), runtime=object())
+
+        # A model this process cannot name is better than a wrong one: the restriction stands
+        # and says so.
+        with pytest.raises(UserError, match="'model' is not available"):
+            _ = loaded.ctx.model
 
     def test_model_response_result_type_is_declared(self) -> None:
         _, codec = _run_context()
