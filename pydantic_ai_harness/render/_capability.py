@@ -43,7 +43,7 @@ from ._compat import (
 )
 from ._context import activate_task_context, current_task_context
 from ._operation_backend import RenderOperationBackend
-from ._toolset_ids import name_capability_toolsets
+from ._toolset_ids import assign_render_toolset_ids
 from ._transports import (
     RenderCancelTransport,
     RenderCapabilityOperationTransport,
@@ -242,10 +242,16 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
     def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
         if self._deps_type is None:
             self._deps_type = agent.deps_type
-        # Before registration reads the ids: a capability's toolset is named after the capability.
-        name_capability_toolsets(agent.toolsets)
+
+        # Render task names include toolset IDs. Capabilities often construct
+        # their toolsets internally, so assign those IDs at the Render boundary
+        # before Pydantic AI registers any operation tasks.
+        assign_render_toolset_ids(agent.toolsets)
+
         self._context_codec = RenderRunContextCodec(
-            deps_type=self._deps_type, agent=agent, resolve_model=self._model_for_task
+            deps_type=self._deps_type,
+            agent=agent,
+            resolve_model=self._resolve_child_task_model,
         )
         self._operation_backend = RenderOperationBackend(
             self.app,
@@ -267,9 +273,10 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         assert codec is not None
         return codec
 
-    def _model_for_task(self, model_id: str | None) -> Model | None:
-        """The registered model a child task's run context should report, if this process has it."""
-        return self._models_by_id.get(model_id if model_id is not None else 'default')
+    def _resolve_child_task_model(self, model_id: str | None) -> Model | None:
+        """Resolve a child task's model from this worker's model registry."""
+        registry_key = model_id or 'default'
+        return self._models_by_id.get(registry_key)
 
     def _capability_operation_parameter_transport(
         self, declaration: CapabilityMethodDeclaration
