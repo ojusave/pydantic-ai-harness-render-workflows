@@ -18,10 +18,10 @@ NameableToolset: TypeAlias = 'FunctionToolset[Any] | DynamicToolset[Any]'
 def assign_render_toolset_ids(toolsets: Sequence[AbstractToolset[Any]]) -> None:
     """Give unnamed capability toolsets stable IDs before Render registers tasks.
 
-    Pydantic AI requires a leaf toolset ID for durable execution. A capability
-    often creates its toolset internally, so the user has no toolset instance
-    to name. The capability ID is stable across the workflow and worker
-    processes, making it the appropriate Render task identity.
+    Pydantic AI's registered backend requires an ID for every leaf toolset.
+    A capability often creates its toolset internally, so the user has no
+    toolset instance to name. The capability ID is stable across the workflow
+    and worker processes, making it the appropriate Render task identity.
     """
     used_ids = {toolset.id for toolset in _walk(toolsets) if toolset.id is not None}
 

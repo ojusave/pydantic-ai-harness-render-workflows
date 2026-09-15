@@ -252,7 +252,7 @@ class RenderDynamicCallTransport(Generic[AgentDepsT], ParameterTransport[Dynamic
 class RenderCapabilityOperationTransport(
     Generic[AgentDepsT], ParameterTransport[CapabilityOperationParams, JSONObject]
 ):
-    """Transport a capability's declared durable operation."""
+    """Transport a capability method declared with `@durable_operation`."""
 
     wire_type = dict
 
@@ -378,7 +378,7 @@ class RenderCancelTransport(Generic[AgentDepsT], ParameterTransport[ModelCancelS
 
 
 class RenderEventStreamHandlerTransport(Generic[AgentDepsT], ParameterTransport[EventStreamHandlerParams, JSONObject]):
-    """Transport one agent stream event to its durable handler."""
+    """Transport one agent stream event to its registered handler task."""
 
     wire_type = dict
     result_type = type(None)

@@ -90,7 +90,7 @@ class RenderBoundOperation(BoundDurableOperation[ParamsT, WireT, ResultT], Gener
 
 
 class RenderOperationBackend(RegisteredOperationBackend[Options | None]):
-    """Register every Pydantic AI durable operation on a Workflows app."""
+    """Register each supported Pydantic AI operation on a Workflows app."""
 
     def __init__(
         self,

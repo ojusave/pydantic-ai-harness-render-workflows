@@ -1,4 +1,4 @@
-"""Render Workflows durability capability."""
+"""Render Workflows execution capability for Pydantic AI agents."""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
 
 @dataclass(init=False)
 class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
-    """Route an agent's durable operations through an explicit Workflows app.
+    """Route supported agent operations through an explicit Workflows app.
 
     Outside a Render task, the capability is transparent. Use this instance's
     `task` decorator for each workflow entry point that calls the agent.
@@ -111,7 +111,7 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
 
         Args:
             app: The exact Render `Workflows` app started by the worker.
-            models: Additional models keyed by their durable ID.
+            models: Additional models keyed by their registered model ID.
             event_stream_handler: Optional handler for agent stream events.
             name: Stable prefix for generated Render task names. Defaults to the agent name.
             deps_type: Dependency type used for task-boundary serialization. Defaults to the
@@ -119,7 +119,8 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
             model_options: Options for model operation tasks.
             tool_options: Options for tool operation tasks.
             event_options: Options for event handler tasks.
-            capability_options: Options for other capabilities' durable operation tasks.
+            capability_options: Options for tasks generated from other capabilities'
+                `@durable_operation` methods.
             resolve_tool_options: Optional resolver for a tool-specific opt-out. Returning
                 `None` keeps `tool_options`, and `False` executes a supported function tool
                 inline. Render fixes task options at registration, so returning different

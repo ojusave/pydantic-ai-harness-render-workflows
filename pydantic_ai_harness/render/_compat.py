@@ -1,4 +1,4 @@
-"""Compatibility boundary for Pydantic AI durable execution internals.
+"""Compatibility boundary for Pydantic AI's registered backend internals.
 
 Pydantic AI does not currently publish the semantic parameter and registered
 operation types needed by a cross-process backend. Keep those imports in this
@@ -119,7 +119,7 @@ def to_json_object(value: object) -> JSONObject:
 
 
 def dump_json_object(type_form: object, value: object) -> JSONObject:
-    """Encode a typed value using Pydantic AI's JSON durability codec."""
+    """Encode a typed value using Pydantic AI's registered JSON codec."""
     return to_json_object(JSON_CODEC.dump(type_form, value))
 
 
@@ -194,7 +194,7 @@ def resolve_tool_for_definition(
     ctx: RunContext[ToolDepsT],
     original_name: str | None = None,
 ) -> ToolsetTool[ToolDepsT]:
-    """Call the durable reconstruction hook implemented by function and MCP toolsets."""
+    """Call the reconstruction hook implemented by function and MCP toolsets."""
     method = getattr(toolset, 'tool_for_tool_def', None)
     if not callable(method):
         raise TypeError(f'{type(toolset).__name__} cannot rebuild a tool from its definition.')
@@ -214,7 +214,7 @@ def make_model_request_context(
     streaming: bool,
 ) -> ModelRequestContext:
     """Build the compaction context whose live model is restored by the handler."""
-    # The durable handler resolves the registered model before invoking
+    # The registered child-task handler resolves the model before invoking
     # `model.compact_messages`. This mirrors Pydantic AI's Temporal transport.
     context = ModelRequestContext(
         model=cast(Model, None),
@@ -422,9 +422,9 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
     def _resolve_model(self, context: Mapping[str, Any]) -> Model | None:
         """Resolve the serialized model ID against this worker's registry.
 
-        The callback returns the plain model, not the durability wrapper used
-        by the parent workflow. This keeps work performed by a child inside
-        that child task. If the ID is unknown, `ctx.model` remains guarded.
+        The callback returns the plain model, not the workflow-side wrapper.
+        This keeps work performed by a child inside that child task. If the ID
+        is unknown, `ctx.model` remains guarded.
         """
         if self._model_resolver is None:
             return None

@@ -39,16 +39,16 @@ async def get_weather(city: str) -> str:
 
 
 app = Workflows()
-durability = RenderWorkflows(app)
+workflows = RenderWorkflows(app)
 agent = Agent(
     'openai:gpt-5.6-sol',
     name='support',
     tools=[get_weather],
-    capabilities=[durability],
+    capabilities=[workflows],
 )
 
 
-@durability.task
+@workflows.task
 async def support(ctx: TaskContext, prompt: str) -> str:
     del ctx
     return (await agent.run(prompt)).output
@@ -66,9 +66,9 @@ For local execution, start that command through the Render CLI development serve
 py-cli render workflows dev -- render-workflows app:app
 ```
 
-`@durability.task` delegates registration to `app.task` and activates the matching `TaskContext`. Agent operations in that scope use `ctx.run(...)` to reach generated child tasks.
+`@workflows.task` delegates registration to `app.task` and activates the matching `TaskContext`. Agent operations in that scope use `ctx.run(...)` to reach generated child tasks.
 
-> **Execution boundary:** Attaching the capability alone does not route every call through Render. A direct `agent.run(...)` outside the matching `@durability.task` scope runs inline. A plain `@app.task` does not activate this capability.
+> **Execution boundary:** Attaching the capability alone does not route every call through Render. A direct `agent.run(...)` outside the matching `@workflows.task` scope runs inline. A plain `@app.task` does not activate this capability.
 
 Pass executable tools and toolsets when constructing the agent. Later or per-run executable toolsets bypass pre-registration and are rejected inside a Render workflow. Give the agent and each toolset stable, unique names because generated task names are persisted workflow identity.
 
@@ -80,9 +80,9 @@ The capability registers the operation types used by the agent:
 - static function-tool argument validation and calls;
 - MCP and dynamic-toolset discovery, instructions, validation, and calls;
 - `event_stream_handler` delivery;
-- durable operations contributed by other capabilities.
+- methods that other capabilities declare with `@durable_operation`.
 
-Outside a `durability.task` scope, these operations call their original Pydantic AI handlers inline. The same agent can therefore run in local tests or non-workflow code.
+Outside a `workflows.task` scope, these operations call their original Pydantic AI handlers inline. The same agent can therefore run in local tests or non-workflow code.
 
 Each operation consumes one registered task. Render currently limits a workflow service to 500 tasks, so include generated agent, model, toolset, event, and capability tasks when estimating service size.
 
@@ -103,7 +103,7 @@ def resolve_tool_options(_operation_id, _tool, tool_name):
 
 
 app = Workflows()
-durability = RenderWorkflows(
+workflows = RenderWorkflows(
     app,
     model_options=Options(
         retry=Retry(max_retries=3, wait_duration_ms=1_000),
@@ -117,7 +117,7 @@ durability = RenderWorkflows(
 )
 ```
 
-Configure the workflow entry task separately, for example `@durability.task(timeout_seconds=600, plan='flex')`.
+Configure the workflow entry task separately, for example `@workflows.task(timeout_seconds=600, plan='flex')`.
 
 Render fixes task options during registration. A generated call task can serve multiple tools in a toolset, so retry, timeout, and plan cannot vary per invocation. Returning different `Options` from the resolver raises `UserError`. Returning `None` keeps `tool_options`. Returning `False` runs a supported static function tool inside the workflow entry task, without an independent child-task retry, timeout, plan, or task record.
 
@@ -137,7 +137,7 @@ Treat the complete agent run and tool side effects as at least once. A retry of 
 
 Render identifies a leaf toolset's tasks by its `id`, and a capability that builds its own toolset leaves that toolset unnamed. Binding names each unnamed capability-contributed leaf after the capability that owns it, so `SubAgents(id='sub_agents')` registers `<agent>__function_toolset__sub_agents.call_tool`. A toolset that came with an `id` keeps it, an `id` another toolset already uses gets a numbered variant, and an unnamed leaf under a capability with no `id` still raises the error that says how to name it. Task names are persisted journal data, so changing a capability's `id` strands runs recorded under the old name.
 
-Model instances do not cross the boundary, but their ids do. A child task resolves the run's model id against the models registered in its own process (the agent's default model plus the `models={...}` entries) and reports that instance as `ctx.model`, which is what lets a tool, a delegated sub-agent, or another capability read the model inside a child task. It resolves to the plain model rather than the workflow side's durable wrapper, so that work stays in the task already running it. A plain-string default that each run resolves for itself has no registered instance, and `ctx.model` remains unavailable in a child task.
+Model instances do not cross the boundary, but their ids do. A child task resolves the run's model id against the models registered in its own process (the agent's default model plus the `models={...}` entries) and reports that instance as `ctx.model`, which is what lets a tool, a delegated sub-agent, or another capability read the model inside a child task. It resolves to the plain model rather than the workflow-side model wrapper, so that work stays in the task already running it. A plain-string default that each run resolves for itself has no registered instance, and `ctx.model` remains unavailable in a child task.
 
 Render owns task-run lineage. This integration spawns children through `TaskContext.run()` and cannot assign `parentTaskRunId` or `rootTaskRunId` itself. Code that draws a run graph should read `rootTaskRunId` where the platform populates it, keep `parentTaskRunId` to work out depth, and page through every task-run listing. Where the root field comes back empty, scope the listing to the Workflow and walk parent links instead.
 
@@ -145,7 +145,7 @@ Coverage for this area works in two layers: deterministic tests for toolset ids,
 
 ## Streaming and cancellation
 
-Streaming is buffered at the model-task boundary. The child task consumes the provider stream and returns its completed response and captured events. The workflow-side agent can replay them after the child task finishes, but provider tokens do not stream live across `ctx.run(...)`. An `event_stream_handler` follows the durable operation path and does not change this boundary.
+Streaming is buffered at the model-task boundary. The child task consumes the provider stream and returns its completed response and captured events. The workflow-side agent delivers them after the child task finishes, but provider tokens do not stream live across `ctx.run(...)`. An `event_stream_handler` follows the generated operation-task path and does not change this boundary.
 
 Render task-run cancellation remains a native client and control-plane action. Pydantic AI cancellation tokens are unsupported inside a Render workflow because they are in-process handles. Suspended-model cleanup uses its own generated child task. Neither form makes external tool side effects transactional.
 
@@ -157,6 +157,6 @@ The capability emits no additional OpenTelemetry spans. Pydantic AI's model and 
 
 ## Pydantic AI compatibility boundary
 
-`RenderWorkflows` uses the public `BaseDurabilityCapability` and durable backend contracts. Pydantic AI does not yet publish every semantic parameter, transport, and bound-operation type needed by a cross-process registered backend. The integration contains those private imports in `pydantic_ai_harness/render/_compat.py`.
+`RenderWorkflows` uses the public `BaseDurabilityCapability` and registered backend contracts. Pydantic AI does not yet publish every semantic parameter, transport, and bound-operation type needed by a cross-process registered backend. The integration contains those private imports in `pydantic_ai_harness/render/_compat.py`.
 
 That containment does not make the private API stable. A Pydantic AI release can require a corresponding Harness update. In production, use a Pydantic AI and Harness combination tested together, and run the Render integration tests before upgrading either dependency independently.
