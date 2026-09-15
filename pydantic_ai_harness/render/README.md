@@ -1,6 +1,8 @@
 # Render Workflows
 
-Use this capability when a Pydantic AI agent should run its model requests, tool calls, event handling, and capability operations as tasks on a [Render Workflows](https://render.com/docs/workflows) app. `RenderWorkflows` registers those tasks with Render and supplies their Pydantic AI operation boundaries and JSON transport.
+Some Pydantic AI agents answer in one model call. Others keep working: a research agent that reads a list of sources and writes a report, a document pipeline that grinds through a batch of files, a monitor that wakes up on a schedule, an agent that fans a question out to several sub-agents in parallel. Runs like those are long-running and distributed. They take minutes, repeat the same model and tool calls across many inputs, need a failed step retried on its own, and belong in background work that outlives the HTTP request that started it.
+
+[`RenderWorkflows`](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/render/) runs that kind of agent on a [Render Workflows](https://render.com/docs/workflows) app. Each model request, tool call, event, and `@durable_operation` method becomes a registered task with its own retry policy, timeout, and compute: managed orchestration and on-demand task compute, not a checkpointed agent loop.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/render/)
 
@@ -25,6 +27,8 @@ The extra installs the Render Python SDK. Use the top-level import:
 ```python
 from pydantic_ai_harness import RenderWorkflows
 ```
+
+A complete Blueprint-backed research agent is in [`pydantic-render-workflows-validation`](https://github.com/ojusave/pydantic-render-workflows-validation).
 
 ## Define the app and agent
 
@@ -63,19 +67,43 @@ Start the exported app with Render's normal worker command:
 uv run render-workflows app:app
 ```
 
-For local execution, start that command through the Render CLI development server:
+`@workflows.task` delegates registration to `app.task` and activates the matching `TaskContext`. Agent operations in that scope use `ctx.run(...)` to reach generated child tasks.
+
+Pass executable tools and toolsets when constructing the agent. Later or per-run executable toolsets bypass pre-registration and are rejected inside a Render workflow. Give the agent and each toolset stable, unique names because generated task names are persisted workflow identity.
+
+## When should a Pydantic AI agent use this?
+
+Use it when the agent job itself needs long-running or distributed task compute: a research run that takes minutes, parallel model and tool calls, per-step retries and timeouts, or background work that should outlive the HTTP request that started it.
+
+Do not wait until someone asks to deploy a web service on Render. A static site or ordinary web service does not register these tasks. Do not use this for Temporal-style replay, crash recovery, or resuming `agent.run` from a checkpoint: Render retries tasks, it does not replay the agent loop.
+
+## How do I run model and tool calls as separate tasks?
+
+Wrap the agent in `@workflows.task` and attach `RenderWorkflows` to the same `Workflows` app. Inside that scope, model requests, tool calls, event handling, and `@durable_operation` methods dispatch as child tasks. Attaching the capability alone does not route every `agent.run` through Render.
+
+## How do I run this locally?
+
+Start the same worker command through the Render CLI development server:
 
 ```bash
 uv run render workflows dev -- render-workflows app:app
 ```
 
-`@workflows.task` delegates registration to `app.task` and activates the matching `TaskContext`. Agent operations in that scope use `ctx.run(...)` to reach generated child tasks.
+That process loads the exported `Workflows` app and registers the generated tasks. Direct `agent.run(...)` in ordinary tests still runs inline, which is useful when you are not exercising the workflow boundary.
 
-> **Execution boundary:** Attaching the capability alone does not route every call through Render. A direct `agent.run(...)` outside the matching `@workflows.task` scope runs inline. A plain `@app.task` does not activate this capability.
+## What happens on retry?
 
-Pass executable tools and toolsets when constructing the agent. Later or per-run executable toolsets bypass pre-registration and are rejected inside a Render workflow. Give the agent and each toolset stable, unique names because generated task names are persisted workflow identity.
+Child tasks retry independently under the Render `Retry` options you set at registration. A retry of one model or tool task can repeat that task's side effects if interruption happens before Render records the result.
 
-A toolset that a capability builds for itself takes its name from that capability's `id`, since nothing else can name it: `SubAgents(id='sub_agents')` registers `<agent>__function_toolset__sub_agents.call_tool`. Renaming the capability is therefore a task rename.
+A retry of the workflow entry task starts `agent.run(...)` again. Work that already finished in the earlier attempt can run a second time. The current Render SDK does not let this integration assign stable idempotency keys to child calls or resume the Pydantic agent loop from a checkpoint. Treat the complete agent run as at least once.
+
+## How do SubAgents show up as tasks?
+
+A capability that builds its own toolset leaves that toolset unnamed. Binding names each unnamed capability-contributed leaf after the capability that owns it, so `SubAgents(id='sub_agents')` registers `<agent>__function_toolset__sub_agents.call_tool`. A toolset that already has an `id` keeps it. Changing a capability's `id` is a task rename and strands runs recorded under the old name.
+
+## Why are no child tasks appearing?
+
+The usual cause is that `agent.run(...)` is not inside the matching `@workflows.task` scope. A direct call outside that decorator runs inline. A plain `@app.task` does not activate this capability. Another cause is `resolve_tool_options` returning `False` for a static function tool: that tool runs inside the entry task and has no independent child-task record.
 
 ## Generated tasks
 
@@ -135,8 +163,6 @@ A child task may run in a fresh process. The capability sends one versioned JSON
 - Model instances do not cross. The default model and entries in `models={...}` are registered by ID and resolved in the child task, which is also where `ctx.model` gets the instance it reports.
 - Render task arguments have a 4 MiB limit. The capability checks the final JSON envelope before dispatch.
 - Live in-process objects are unavailable unless the reconstructed run context explicitly supports them.
-
-Treat the complete agent run and tool side effects as at least once. A retry of an individual child task can repeat its external side effect if interruption occurs before Render records the result. A retry of the workflow entry task starts `agent.run(...)` again and can repeat model requests and tool calls that completed during the earlier attempt. The current Render SDK does not let this integration assign stable idempotency keys to child task calls or resume the Pydantic agent loop from a checkpoint.
 
 ## Streaming and cancellation
 
