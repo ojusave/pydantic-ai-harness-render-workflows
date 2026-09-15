@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, TypeAlias
+from collections.abc import Awaitable, Sequence
+from typing import Any, Protocol, TypeAlias, runtime_checkable
 
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities.abstract import AbstractCapability
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, FunctionToolset
 
 from ._compat import CapabilityOwnedToolset
 
 __all__ = ('reject_unnameable_capability_toolsets',)
 
-SupportedLeafToolset: TypeAlias = 'FunctionToolset[Any] | DynamicToolset[Any] | MCPToolset[Any]'
+SupportedLeafToolset: TypeAlias = 'AbstractToolset[Any]'
+
+
+@runtime_checkable
+class _MCPToolsetShape(Protocol):
+    """Identify MCP leaves without importing the optional MCP client package."""
+
+    def list_resources(self) -> Awaitable[object]: ...
 
 
 def reject_unnameable_capability_toolsets(toolsets: Sequence[AbstractToolset[Any]]) -> None:
@@ -45,7 +51,7 @@ def _owned_leaves(
             continue
 
         for leaf in _walk((node.wrapped,)):
-            if isinstance(leaf, FunctionToolset | DynamicToolset | MCPToolset):
+            if _is_supported_leaf(leaf):
                 # Nested capability wrappers are visited after their parents,
                 # so the closest capability becomes the owner.
                 owners[id(leaf)] = (leaf, node.capability)
@@ -54,9 +60,11 @@ def _owned_leaves(
 
 
 def _supported_leaves(toolsets: Sequence[AbstractToolset[Any]]) -> list[SupportedLeafToolset]:
-    return [
-        toolset for toolset in _walk(toolsets) if isinstance(toolset, FunctionToolset | DynamicToolset | MCPToolset)
-    ]
+    return [toolset for toolset in _walk(toolsets) if _is_supported_leaf(toolset)]
+
+
+def _is_supported_leaf(toolset: AbstractToolset[Any]) -> bool:
+    return isinstance(toolset, FunctionToolset | DynamicToolset | _MCPToolsetShape)
 
 
 def _reject_other_invalid_ids(leaves: Sequence[SupportedLeafToolset]) -> None:

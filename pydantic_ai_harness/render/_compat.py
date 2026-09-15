@@ -16,8 +16,7 @@ from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias, TypeVar, ov
 from pydantic import TypeAdapter
 from pydantic_ai._run_context import AnchoredEvidence, CapabilityEventT, CustomEventT
 from pydantic_ai.agent.abstract import AbstractAgent
-from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.capabilities.abstract import leaf_capabilities
+from pydantic_ai.capabilities.abstract import AbstractCapability, leaf_capabilities
 from pydantic_ai.durable_exec import JSON_CODEC
 from pydantic_ai.durable_exec._capability_operation import (
     CapabilityMethodDeclaration,

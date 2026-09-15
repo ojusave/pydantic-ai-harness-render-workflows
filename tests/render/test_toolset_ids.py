@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import subprocess
+import sys
 
 import pytest
 from pydantic_ai import Agent, FunctionToolset
@@ -15,6 +17,28 @@ from render.workflows import TaskContext, Workflows
 from pydantic_ai_harness import RenderWorkflows
 
 from .conftest import RecordingTaskContext
+
+
+def test_importing_render_workflows_does_not_add_an_optional_mcp_import() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            (
+                'import sys; '
+                'from pydantic_ai.agent import AbstractAgent; '
+                'before = "pydantic_ai.mcp" in sys.modules; '
+                'from pydantic_ai_harness import RenderWorkflows; '
+                'assert AbstractAgent and RenderWorkflows; '
+                'assert ("pydantic_ai.mcp" in sys.modules) == before'
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 class Notes(AbstractCapability[None]):
