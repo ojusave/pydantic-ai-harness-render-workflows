@@ -9,7 +9,7 @@ from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import AgentStreamEvent, ModelMessage, ModelResponse
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
 from ._compat import (
     CallToolResult,
@@ -22,7 +22,7 @@ from ._compat import (
     ModelCancelSuspendedResponseParams,
     ModelCompactMessagesParams,
     ModelRequestParams,
-    ParameterTransport,
+    RenderJsonTransport,
     RenderRunContextCodec,
     ToolsetCallToolParams,
     ToolsetGetToolsParams,
@@ -34,7 +34,8 @@ from ._compat import (
     make_model_request_context,
     model_settings_from_json,
     model_settings_to_json,
-    resolve_tool_for_definition,
+    resolve_function_tool_for_definition,
+    resolve_mcp_tool_for_definition,
 )
 
 __all__ = (
@@ -107,10 +108,7 @@ class _EventPayload:
     run_context: JSONObject
 
 
-class RenderFunctionCallTransport(Generic[AgentDepsT], ParameterTransport[ToolsetCallToolParams, JSONObject]):
-    """Transport one static function-tool call."""
-
-    wire_type = dict
+class RenderFunctionCallTransport(Generic[AgentDepsT], RenderJsonTransport[ToolsetCallToolParams]):
     result_type = CallToolResult
 
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT], toolset: FunctionToolset[AgentDepsT]) -> None:
@@ -136,7 +134,7 @@ class RenderFunctionCallTransport(Generic[AgentDepsT], ParameterTransport[Toolse
         ctx = self._context_codec.load(decoded.run_context)
         try:
             tool = (
-                resolve_tool_for_definition(
+                resolve_function_tool_for_definition(
                     self._toolset,
                     decoded.tool_def,
                     ctx=ctx,
@@ -158,11 +156,7 @@ class RenderFunctionCallTransport(Generic[AgentDepsT], ParameterTransport[Toolse
         )
 
 
-class RenderGetToolsTransport(Generic[AgentDepsT], ParameterTransport[ToolsetGetToolsParams, JSONObject]):
-    """Transport function, MCP, or dynamic tool discovery context."""
-
-    wire_type = dict
-
+class RenderGetToolsTransport(Generic[AgentDepsT], RenderJsonTransport[ToolsetGetToolsParams]):
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT], *, result_type: object) -> None:
         self._context_codec = context_codec
         self.result_type = result_type
@@ -177,19 +171,18 @@ class RenderGetToolsTransport(Generic[AgentDepsT], ParameterTransport[ToolsetGet
 
 
 class RenderDynamicGetToolsTransport(RenderGetToolsTransport[AgentDepsT]):
-    """Transport dynamic toolset discovery."""
-
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT]) -> None:
         super().__init__(context_codec, result_type=DynamicToolsResult)
 
 
-class RenderMCPCallTransport(Generic[AgentDepsT], ParameterTransport[ToolsetCallToolParams, JSONObject]):
-    """Transport an MCP tool call and rebuild its live tool object."""
-
-    wire_type = dict
+class RenderMCPCallTransport(Generic[AgentDepsT], RenderJsonTransport[ToolsetCallToolParams]):
     result_type = CallToolResult
 
-    def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT], toolset: object) -> None:
+    def __init__(
+        self,
+        context_codec: RenderRunContextCodec[AgentDepsT],
+        toolset: AbstractToolset[AgentDepsT],
+    ) -> None:
         self._context_codec = context_codec
         self._toolset = toolset
 
@@ -211,7 +204,7 @@ class RenderMCPCallTransport(Generic[AgentDepsT], ParameterTransport[ToolsetCall
         ctx = self._context_codec.load(decoded.run_context)
         if decoded.tool_def is None:
             raise ValueError(f'MCP tool {decoded.name!r} has no serialized definition.')
-        tool = resolve_tool_for_definition(self._toolset, decoded.tool_def, ctx=ctx)
+        tool = resolve_mcp_tool_for_definition(self._toolset, decoded.tool_def, ctx=ctx)
         return ToolsetCallToolParams(
             decoded.name,
             tool_args=load_json_object(decoded.tool_args),
@@ -220,10 +213,7 @@ class RenderMCPCallTransport(Generic[AgentDepsT], ParameterTransport[ToolsetCall
         )
 
 
-class RenderDynamicCallTransport(Generic[AgentDepsT], ParameterTransport[DynamicToolsetCallToolParams, JSONObject]):
-    """Transport a dynamic-toolset call."""
-
-    wire_type = dict
+class RenderDynamicCallTransport(Generic[AgentDepsT], RenderJsonTransport[DynamicToolsetCallToolParams]):
     result_type = CallToolResult
 
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT]) -> None:
@@ -249,13 +239,7 @@ class RenderDynamicCallTransport(Generic[AgentDepsT], ParameterTransport[Dynamic
         )
 
 
-class RenderCapabilityOperationTransport(
-    Generic[AgentDepsT], ParameterTransport[CapabilityOperationParams, JSONObject]
-):
-    """Transport a capability method declared with `@durable_operation`."""
-
-    wire_type = dict
-
+class RenderCapabilityOperationTransport(Generic[AgentDepsT], RenderJsonTransport[CapabilityOperationParams]):
     def __init__(
         self,
         context_codec: RenderRunContextCodec[AgentDepsT],
@@ -282,11 +266,7 @@ class RenderCapabilityOperationTransport(
         )
 
 
-class RenderModelRequestTransport(Generic[AgentDepsT], ParameterTransport[ModelRequestParams, JSONObject]):
-    """Transport a normal or buffered-stream model request."""
-
-    wire_type = dict
-
+class RenderModelRequestTransport(Generic[AgentDepsT], RenderJsonTransport[ModelRequestParams]):
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT], *, result_type: object) -> None:
         self._context_codec = context_codec
         self.result_type = result_type
@@ -313,10 +293,7 @@ class RenderModelRequestTransport(Generic[AgentDepsT], ParameterTransport[ModelR
         )
 
 
-class RenderCompactMessagesTransport(Generic[AgentDepsT], ParameterTransport[ModelCompactMessagesParams, JSONObject]):
-    """Transport a model message-compaction request."""
-
-    wire_type = dict
+class RenderCompactMessagesTransport(Generic[AgentDepsT], RenderJsonTransport[ModelCompactMessagesParams]):
     result_type = ModelResponse
 
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT]) -> None:
@@ -353,10 +330,7 @@ class RenderCompactMessagesTransport(Generic[AgentDepsT], ParameterTransport[Mod
         )
 
 
-class RenderCancelTransport(Generic[AgentDepsT], ParameterTransport[ModelCancelSuspendedResponseParams, JSONObject]):
-    """Transport cleanup of a suspended model response."""
-
-    wire_type = dict
+class RenderCancelTransport(Generic[AgentDepsT], RenderJsonTransport[ModelCancelSuspendedResponseParams]):
     result_type = type(None)
 
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT]) -> None:
@@ -377,10 +351,7 @@ class RenderCancelTransport(Generic[AgentDepsT], ParameterTransport[ModelCancelS
         return ModelCancelSuspendedResponseParams(decoded.model_id, response=decoded.response, run_context=ctx)
 
 
-class RenderEventStreamHandlerTransport(Generic[AgentDepsT], ParameterTransport[EventStreamHandlerParams, JSONObject]):
-    """Transport one agent stream event to its registered handler task."""
-
-    wire_type = dict
+class RenderEventStreamHandlerTransport(Generic[AgentDepsT], RenderJsonTransport[EventStreamHandlerParams]):
     result_type = type(None)
 
     def __init__(self, context_codec: RenderRunContextCodec[AgentDepsT]) -> None:

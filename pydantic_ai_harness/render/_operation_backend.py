@@ -11,12 +11,12 @@ from render import Options, Retry, TaskContext, Workflows
 from render.workflows import TaskDefinition
 
 from ._compat import BoundDurableOperation, DurableOperation, dump_operation_params, load_operation_params
-from ._context import activate_task_context, current_task_context
 from ._protocol import (
     OperationRequest,
     OperationResult,
     control_flow_error,
     make_request,
+    permanent_error,
     read_request,
     read_result,
     success,
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 ParamsT = TypeVar('ParamsT')
 WireT = TypeVar('WireT')
 ResultT = TypeVar('ResultT')
+RuntimeDepsT = TypeVar('RuntimeDepsT')
 
 
 def _snapshot_options(options: Options) -> Options:
@@ -47,7 +48,10 @@ def _snapshot_options(options: Options) -> Options:
     )
 
 
-class RenderBoundOperation(BoundDurableOperation[ParamsT, WireT, ResultT], Generic[ParamsT, WireT, ResultT]):
+class RenderBoundOperation(
+    BoundDurableOperation[ParamsT, WireT, ResultT],
+    Generic[ParamsT, WireT, ResultT, RuntimeDepsT],
+):
     """Dispatch one operation through its statically registered Render task."""
 
     def __init__(
@@ -57,21 +61,20 @@ class RenderBoundOperation(BoundDurableOperation[ParamsT, WireT, ResultT], Gener
         task: TaskDefinition[[OperationRequest], OperationResult],
         operation_name: str,
         options: Options | None,
-        runtime: RenderWorkflows,
+        runtime: RenderWorkflows[RuntimeDepsT],
     ) -> None:
         self._operation = operation
         self.task = task
         self._operation_name = operation_name
         self._options = options
         self._runtime = runtime
-        self._owner_token = runtime._owner_token  # pyright: ignore[reportPrivateUsage]
 
     @property
     def operation(self) -> DurableOperation[ParamsT, WireT, ResultT]:
         return self._operation
 
     async def __call__(self, params: ParamsT, *, config: object | None = None) -> ResultT:
-        context = current_task_context(self._owner_token)
+        context = self._runtime.current_task_context
         if context is None:
             return await self._operation.handler(params)
 
@@ -89,21 +92,20 @@ class RenderBoundOperation(BoundDurableOperation[ParamsT, WireT, ResultT], Gener
             )
 
 
-class RenderOperationBackend(RegisteredOperationBackend[Options | None]):
+class RenderOperationBackend(RegisteredOperationBackend[Options | None], Generic[RuntimeDepsT]):
     """Register each supported Pydantic AI operation on a Workflows app."""
 
     def __init__(
         self,
         app: Workflows,
         *,
-        runtime: RenderWorkflows,
+        runtime: RenderWorkflows[RuntimeDepsT],
         agent_name: str,
         config: RoleBasedOperationConfig[Options | None],
     ) -> None:
         super().__init__(namer=JournalOperationNamer(agent_name), config=config)
         self._app = app
         self._runtime = runtime
-        self._owner_token = runtime._owner_token  # pyright: ignore[reportPrivateUsage]
 
     def register(
         self,
@@ -113,20 +115,35 @@ class RenderOperationBackend(RegisteredOperationBackend[Options | None]):
         config: Options | None,
     ) -> tuple[BoundDurableOperation[ParamsT, WireT, ResultT], Sequence[Callable[..., object]]]:
         async def operation_task(context: TaskContext, request: OperationRequest) -> OperationResult:
-            wire_params = read_request(request, expected_operation=name)
-            params = load_operation_params(operation, wire_params, runtime=self._runtime)
             try:
-                with activate_task_context(self._owner_token, context):
-                    value = await operation.handler(params)
-                return success(operation.result_codec.dump(value))
+                wire_params = read_request(request, expected_operation=name)
+                params = load_operation_params(operation, wire_params, runtime=self._runtime)
             except Exception as exc:
-                expected_error = control_flow_error(exc)
+                # Retrying cannot repair persisted request bytes or worker-side decoding.
+                return permanent_error('invalid-request', exc)
+
+            try:
+                with self._runtime.activate(context):
+                    value = await operation.handler(params)
+            except Exception as exc:
+                try:
+                    expected_error = control_flow_error(exc)
+                except Exception as encoding_error:
+                    return permanent_error('invalid-result', encoding_error)
                 if expected_error is not None:
                     return expected_error
                 raise
 
+            try:
+                return success(operation.result_codec.dump(value))
+            except Exception as exc:
+                # The handler may already have committed an external side effect.
+                return permanent_error('invalid-result', exc)
+
         registered_config = _snapshot_options(config) if config is not None else None
         options = registered_config or Options()
+        # A `None` field intentionally lets the public Workflows API resolve its app default
+        # when this task is registered; only explicit per-operation values are snapshotted here.
         task = self._app.task(
             name=name,
             retry=options.retry,
@@ -140,6 +157,6 @@ class RenderOperationBackend(RegisteredOperationBackend[Options | None]):
             options=registered_config,
             runtime=self._runtime,
         )
-        # Render registers the TaskDefinition directly on `app`. The generic backend contract
-        # only accepts callable worker registrations, so there is no additional handle to return.
+        # `app.task` has already registered the task definition. The generic backend's second
+        # return value is for worker-registration callables, not task runs, so it is empty here.
         return bound, ()

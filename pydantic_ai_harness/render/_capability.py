@@ -2,20 +2,12 @@
 
 from __future__ import annotations
 
-try:
-    import render  # noqa: F401  # pyright: ignore[reportUnusedImport]
-except ImportError as _import_error:  # pragma: no cover
-    raise ImportError(
-        'Please install the `render` package to use the Render Workflows capability, '
-        'for example with `pip install "pydantic-ai-harness[render]"`.'
-    ) from _import_error
-
 import functools
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, ClassVar, Concatenate, Literal, ParamSpec, TypeVar, overload
+from typing import Any, ClassVar, Concatenate, Literal, ParamSpec, Protocol, TypeVar, overload
 
 from pydantic_ai.agent import AbstractAgent, EventStreamHandler
 from pydantic_ai.durable_exec import (
@@ -33,17 +25,24 @@ from pydantic_ai.messages import InstructionPart
 from pydantic_ai.models import Model
 from pydantic_ai.tools import AgentDepsT, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, DynamicToolset, FunctionToolset
-from render import Options, Retry, TaskContext, Workflows
-from render.workflows import TaskDefinition
-from render.workflows.task import BoundTaskDecorator
+
+try:
+    from render import Options, Retry, TaskContext, Workflows
+    from render.workflows import TaskDefinition
+except ImportError as _import_error:  # pragma: no cover
+    raise ImportError(
+        'Please install the `render` package to use the Render Workflows capability, '
+        'for example with `pip install "pydantic-ai-harness[render]"`.'
+    ) from _import_error
 
 from ._compat import (
     CapabilityMethodDeclaration,
     RenderRunContextCodec,
+    reject_unidentified_operation_capabilities,
 )
 from ._context import activate_task_context, current_task_context
 from ._operation_backend import RenderOperationBackend
-from ._toolset_ids import assign_render_toolset_ids
+from ._toolset_ids import reject_unnameable_capability_toolsets
 from ._transports import (
     RenderCancelTransport,
     RenderCapabilityOperationTransport,
@@ -66,6 +65,23 @@ ToolOptionsResolver = Callable[
 ]
 
 Instructions = str | InstructionPart | Sequence[str | InstructionPart] | None
+
+
+class TaskDecorator(Protocol):
+    """The decorator `RenderWorkflows.task(...)` returns when it is given options.
+
+    The Render SDK types this shape as `render.workflows.task.BoundTaskDecorator`, which
+    neither `render` nor `render.workflows` exports. Restating it structurally keeps the
+    runtime import surface to Render's public API while the two overloads stay compatible.
+    """
+
+    # The async overload must stay first: a coroutine function also matches the sync
+    # signature, with `R` bound to the coroutine rather than to its result.
+    @overload
+    def __call__(self, func: Callable[Concatenate[TaskContext, P], Awaitable[R]], /) -> TaskDefinition[P, R]: ...
+
+    @overload
+    def __call__(self, func: Callable[Concatenate[TaskContext, P], R], /) -> TaskDefinition[P, R]: ...
 
 
 @dataclass(init=False)
@@ -154,15 +170,20 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
             capability=capability_options or Options(),
             resolve_tool=resolve_options if resolve_tool_options is not None else None,
         )
-        self._operation_backend: RenderOperationBackend | None = None
+        self._operation_backend: RenderOperationBackend[AgentDepsT] | None = None
         self._context_codec: RenderRunContextCodec[Any] | None = None
         # BaseDurabilityCapability binds a shallow copy. The original task decorator and the
         # bound runtime intentionally share this token while remaining isolated from other apps.
         self._owner_token = object()
 
     @property
+    def current_task_context(self) -> TaskContext | None:
+        """Return the active Render task context for this capability."""
+        return current_task_context(self._owner_token)
+
+    @property
     def in_durable_context(self) -> bool:
-        return current_task_context(self._owner_token) is not None
+        return self.current_task_context is not None
 
     def activate(self, context: TaskContext) -> AbstractContextManager[None]:
         """Activate a Render task context for an adapter or local test harness."""
@@ -174,6 +195,24 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
                 'An agent with `RenderWorkflows` must be constructed outside a Render workflow so '
                 'its operation tasks are registered before the worker starts.'
             )
+
+    @classmethod
+    def _check_single_capability(cls, agent: AbstractAgent[Any, Any]) -> None:
+        """Refuse a second `RenderWorkflows` while the agent is still being built.
+
+        `from_agent` is the engine's own lookup and already rejects a second instance, but
+        only once something asks for the bound capability. Asking here means the agent is
+        never constructed with two registered task sets and no defined answer for which
+        `Workflows` app a run dispatches to.
+        """
+        try:
+            cls.from_agent(agent)
+        except UserError as exc:
+            raise UserError(
+                'Attach exactly one `RenderWorkflows` capability to an agent. Each one registers a '
+                'full set of Render tasks against the `Workflows` app it was given, so a second '
+                'leaves the agent with two sets and nothing to say which app a run dispatches to.'
+            ) from exc
 
     # The async overload comes first so a coroutine function does not bind `R` to its coroutine.
     @overload
@@ -198,7 +237,7 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         retry: Retry | None = ...,
         timeout_seconds: int | None = ...,
         plan: str | None = ...,
-    ) -> BoundTaskDecorator: ...
+    ) -> TaskDecorator: ...
 
     def task(
         self,
@@ -208,7 +247,7 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         retry: Retry | None = None,
         timeout_seconds: int | None = None,
         plan: str | None = None,
-    ) -> Any:
+    ) -> TaskDefinition[..., Any] | TaskDecorator:
         """Register a task that activates this capability's Render context."""
 
         def decorator(task_func: Callable[..., Any]) -> TaskDefinition[..., Any]:
@@ -228,26 +267,29 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
                         return task_func(context, *args, **kwargs)
 
                 wrapped = sync_wrapper
-            return self.app.task(  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
-                wrapped,
+            return self.app.task(
                 name=name,
                 retry=retry,
                 timeout_seconds=timeout_seconds,
                 plan=plan,
-            )
+            )(wrapped)
 
         if func is None:
             return decorator
         return decorator(func)
 
     def _bind_to_agent(self, agent: AbstractAgent[AgentDepsT, Any]) -> None:
+        self._check_single_capability(agent)
+
         if self._deps_type is None:
             self._deps_type = agent.deps_type
 
-        # Render task names include toolset IDs. Capabilities often construct
-        # their toolsets internally, so assign those IDs at the Render boundary
-        # before Pydantic AI registers any operation tasks.
-        assign_render_toolset_ids(agent.toolsets)
+        # Render task names are persisted workflow identity, so an unnameable toolset is
+        # refused here rather than registered under a derived name.
+        reject_unnameable_capability_toolsets(agent.toolsets)
+        # Pydantic AI reaches the same check while registering capability operations, by
+        # which point this app is already holding tasks that nothing can unregister.
+        reject_unidentified_operation_capabilities(agent.root_capability)
 
         self._context_codec = RenderRunContextCodec(
             deps_type=self._deps_type,
@@ -256,22 +298,27 @@ class RenderWorkflows(BaseDurabilityCapability[AgentDepsT]):
         )
         self._operation_backend = RenderOperationBackend(
             self.app,
-            runtime=self,  # pyright: ignore[reportArgumentType]
+            runtime=self,
             agent_name=self.name,
             config=self._operation_config,
         )
+        # Toolset identity was preflighted above, so the base bind cannot reject an invalid
+        # or duplicate ID after this event task is registered. Event binding must still come
+        # first because the durable wrappers created by the base bind capture it.
         if self._event_stream_handler is not None:
             self._bound_event_operation = self._bind_event_operation(self._operation_backend)
         super()._bind_to_agent(agent)
 
     def get_durable_operation_backend(self) -> DurableOperationBackend[Options | None]:
         backend = self._operation_backend
-        assert backend is not None
+        if backend is None:
+            raise UserError('`RenderWorkflows` must be bound to an agent before its operation backend is used.')
         return backend
 
     def _codec(self) -> RenderRunContextCodec[Any]:
         codec = self._context_codec
-        assert codec is not None
+        if codec is None:
+            raise UserError('`RenderWorkflows` must be bound to an agent before its operation transports are used.')
         return codec
 
     def _resolve_child_task_model(self, model_id: str | None) -> Model | None:

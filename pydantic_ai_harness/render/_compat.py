@@ -1,19 +1,23 @@
-"""Compatibility boundary for Pydantic AI's registered backend internals.
+"""Compatibility boundary for unpublished Pydantic AI durability semantics.
 
-Pydantic AI does not currently publish the semantic parameter and registered
-operation types needed by a cross-process backend. Keep those imports in this
-module so an upstream API change has one repair point.
+Cross-process operation parameters, capability ownership, capability-operation
+discovery, and partial `RunContext` reconstruction do not yet have public APIs.
+Their private imports and unavoidable dynamic typing stay here so an upstream
+change has one repair point. Vendor and general framework internals do not
+belong in this module.
 """
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast, overload
+from abc import ABC
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias, TypeVar, overload, runtime_checkable
 
 from pydantic import TypeAdapter
 from pydantic_ai._run_context import AnchoredEvidence, CapabilityEventT, CustomEventT
 from pydantic_ai.agent.abstract import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities.abstract import leaf_capabilities
 from pydantic_ai.durable_exec import JSON_CODEC
 from pydantic_ai.durable_exec._capability_operation import (
     CapabilityMethodDeclaration,
@@ -41,13 +45,12 @@ from pydantic_ai.durable_exec._toolset import (
     enqueue_not_supported_message,
     validation_context_from_agent,
 )
-from pydantic_ai.durable_exec._utils import StreamedActivityResult
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import CapabilityEvent, CustomEvent, ModelMessage
+from pydantic_ai.messages import CapabilityEvent, CustomEvent, ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext, ToolDefinition
-from pydantic_ai.toolsets import ToolsetTool
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
 from pydantic_ai.toolsets._capability_owned import CapabilityOwnedToolset
 from pydantic_ai.toolsets.function import FunctionToolsetTool
 from pydantic_ai.usage import RunUsage, UsageLimits
@@ -72,10 +75,9 @@ __all__ = (
     'ModelCompactMessagesParams',
     'ModelRequestContextProjection',
     'ModelRequestParams',
-    'ParameterTransport',
+    'RenderJsonTransport',
     'RenderRunContext',
     'RenderRunContextCodec',
-    'StreamedActivityResult',
     'ToolsetCallToolParams',
     'ToolsetGetToolsParams',
     'capability_operation_result_type',
@@ -89,7 +91,10 @@ __all__ = (
     'make_model_request_context',
     'model_settings_from_json',
     'model_settings_to_json',
-    'resolve_tool_for_definition',
+    'normalize_json_value',
+    'reject_unidentified_operation_capabilities',
+    'resolve_function_tool_for_definition',
+    'resolve_mcp_tool_for_definition',
     'to_json_object',
 )
 
@@ -107,15 +112,95 @@ ResultT = TypeVar('ResultT')
 AgentDepsT = TypeVarExtensions('AgentDepsT', default=object)
 ToolDepsT = TypeVar('ToolDepsT')
 
+_JSON_OBJECT_ADAPTER: TypeAdapter[dict[str, object]] = TypeAdapter(dict[str, object])
+_OPEN_OBJECT_ADAPTER: TypeAdapter[dict[object, object]] = TypeAdapter(dict[object, object])
+_LIST_ADAPTER: TypeAdapter[list[object]] = TypeAdapter(list[object])
+_TUPLE_ADAPTER: TypeAdapter[tuple[object, ...]] = TypeAdapter(tuple[object, ...])
+
+
+class RenderJsonTransport(ParameterTransport[ParamsT, JSONObject], ABC):
+    """Nominal base for every parameter transport this integration installs.
+
+    The framework's transport contract is generic over its wire type. Every
+    Render operation crosses as a JSON object, so fixing the wire here lets
+    `load_operation_params` narrow on a declared base instead of asserting a
+    wire type it cannot see.
+    """
+
+    wire_type = dict
+
+
+@runtime_checkable
+class _ToolDefinitionResolver(Protocol):
+    """The tool-reconstruction hook an MCP toolset publishes with no shared base.
+
+    `FunctionToolset` declares `tool_for_tool_def` statically, so function tools
+    are rebuilt through that public signature. `AbstractToolset` does not declare
+    it, and the capability hands MCP toolsets over as the abstract type, so this
+    structural protocol is the checked narrowing point for that one call.
+
+    The deps type is erased exactly as Pydantic AI erases it on the operation
+    parameter records this feeds (`ToolsetCallToolParams.ctx` is `RunContext[Any]`
+    and its `tool` is `ToolsetTool[Any]`). Parameterizing it instead would make
+    `isinstance` narrow to a partially unknown type, which is strictly worse.
+    """
+
+    def tool_for_tool_def(self, tool_def: ToolDefinition, *, ctx: RunContext[Any]) -> ToolsetTool[Any]: ...
+
+
+class _CompactionModelPlaceholder(Model):
+    """Inert public-model adapter replaced before compaction is invoked."""
+
+    @property
+    def model_name(self) -> str:
+        return 'render-compaction-placeholder'
+
+    @property
+    def system(self) -> str:
+        return 'render'
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        del messages, model_settings, model_request_parameters
+        raise RuntimeError('The compaction model placeholder must be replaced before use.')
+
 
 def to_json_object(value: object) -> JSONObject:
-    """Validate an already encoded value as a JSON object."""
-    # A real JSON encode/decode avoids Pydantic's recursive-alias schema bug on
-    # Python 3.14 while proving this value can cross the Render boundary.
-    normalized = cast(object, json.loads(json.dumps(value, allow_nan=False)))
+    normalized = normalize_json_value(value)
     if not isinstance(normalized, dict):
         raise TypeError(f'Expected a JSON object, got {type(normalized).__name__}.')
-    return cast(JSONObject, normalized)
+    return _JSON_OBJECT_ADAPTER.validate_python(normalized, strict=True)
+
+
+def normalize_json_value(value: object) -> JSONValue:
+    """Validate and normalize an encoded value without coercing mapping keys."""
+    normalized = _normalize_json_value(value)
+    # The recursive check gives mapping keys their Python semantics before the
+    # encoder can turn keys such as `1` into strings.
+    json.dumps(normalized, allow_nan=False)
+    return normalized
+
+
+def _normalize_json_value(value: object) -> JSONValue:
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    if isinstance(value, list):
+        return [_normalize_json_value(item) for item in _LIST_ADAPTER.validate_python(value, strict=True)]
+    if isinstance(value, tuple):
+        return [_normalize_json_value(item) for item in _TUPLE_ADAPTER.validate_python(value, strict=True)]
+    if isinstance(value, dict):
+        mapping = _OPEN_OBJECT_ADAPTER.validate_python(value, strict=True)
+        normalized: dict[str, JSONValue] = {}
+        for key, item in mapping.items():
+            if not isinstance(key, str):
+                raise TypeError(f'JSON object keys must be strings, got {type(key).__name__}.')
+            normalized[key] = _normalize_json_value(item)
+        return normalized
+    raise TypeError(f'Expected a JSON value, got {type(value).__name__}.')
 
 
 def dump_json_object(type_form: object, value: object) -> JSONObject:
@@ -138,9 +223,13 @@ def load_operation_params(
 
     Pydantic's generic registered-backend contract permits any `WireT`, while
     this integration only installs transports whose wire is `JSONObject`.
-    The cast is contained here so the backend remains strictly typed.
+    Reject an incompatible transport rather than asserting its wire type.
     """
-    return operation.parameter_transport.load(cast(WireT, payload), runtime=runtime)
+    transport = operation.parameter_transport
+    if not isinstance(transport, RenderJsonTransport):
+        raise TypeError(f'{type(transport).__name__} does not accept the Render JSON-object wire.')
+    json_transport: RenderJsonTransport[ParamsT] = transport
+    return json_transport.load(payload, runtime=runtime)
 
 
 def load_json_type(type_form: type[T], payload: object) -> T:
@@ -160,8 +249,8 @@ def load_json_object(payload: JSONObject) -> dict[str, Any]:
     value = JSON_CODEC.load(dict[str, Any], payload)
     if not isinstance(value, dict):  # pragma: no cover - Pydantic validates the declared mapping
         raise TypeError(f'Expected dict, got {type(value).__name__}.')
-    # `DurabilityCodec` returns `Any`; Pydantic validated this exact open mapping type.
-    return cast(dict[str, Any], value)
+    # Pydantic validates this exact open mapping type before the adapter narrows it.
+    return TypeAdapter(dict[str, Any]).validate_python(value)
 
 
 def model_settings_to_json(value: ModelSettings | None) -> JSONObject | None:
@@ -175,9 +264,13 @@ def model_settings_from_json(value: JSONObject | None) -> ModelSettings | None:
     """Restore the open mapping accepted by the `ModelSettings` TypedDict API."""
     if value is None:
         return None
-    # Model settings subclasses add provider keys. Treating the decoded open
-    # mapping as the base TypedDict preserves those keys without narrowing them.
-    return cast(ModelSettings, load_json_object(value))
+    # `ModelSettings` declares `timeout` as `httpx.Timeout`, so Pydantic cannot build a schema
+    # for the TypedDict itself and `TypeAdapter(ModelSettings)` raises at import time. The
+    # decoded open mapping is validated instead, which also keeps the extra keys provider
+    # subclasses add. Re-typing that validated mapping as the TypedDict is the one irreducible
+    # `Any` seam here: a `dict[str, Any]` is not assignable to a TypedDict.
+    settings: Any = load_json_object(value)
+    return settings
 
 
 def function_tool_original_name(tool: ToolsetTool[ToolDepsT]) -> str | None:
@@ -187,22 +280,27 @@ def function_tool_original_name(tool: ToolsetTool[ToolDepsT]) -> str | None:
     return None
 
 
-def resolve_tool_for_definition(
-    toolset: object,
+def resolve_function_tool_for_definition(
+    toolset: FunctionToolset[ToolDepsT],
     tool_def: ToolDefinition,
     *,
     ctx: RunContext[ToolDepsT],
     original_name: str | None = None,
 ) -> ToolsetTool[ToolDepsT]:
-    """Call the reconstruction hook implemented by function and MCP toolsets."""
-    method = getattr(toolset, 'tool_for_tool_def', None)
-    if not callable(method):
+    """Rebuild a function tool from its definition through the public toolset API."""
+    return toolset.tool_for_tool_def(tool_def, ctx=ctx, original_name=original_name)
+
+
+def resolve_mcp_tool_for_definition(
+    toolset: AbstractToolset[ToolDepsT],
+    tool_def: ToolDefinition,
+    *,
+    ctx: RunContext[ToolDepsT],
+) -> ToolsetTool[Any]:
+    """Rebuild an MCP tool from its definition, narrowing the undeclared hook once."""
+    if not isinstance(toolset, _ToolDefinitionResolver):
         raise TypeError(f'{type(toolset).__name__} cannot rebuild a tool from its definition.')
-    # Both FunctionToolset and the MCP toolset expose this method, but there is
-    # no shared public protocol. This call is the contained compatibility edge.
-    if original_name is None:
-        return cast(ToolsetTool[ToolDepsT], method(tool_def, ctx=ctx))
-    return cast(ToolsetTool[ToolDepsT], method(tool_def, ctx=ctx, original_name=original_name))
+    return toolset.tool_for_tool_def(tool_def, ctx=ctx)
 
 
 def make_model_request_context(
@@ -217,7 +315,7 @@ def make_model_request_context(
     # The registered child-task handler resolves the model before invoking
     # `model.compact_messages`. This mirrors Pydantic AI's Temporal transport.
     context = ModelRequestContext(
-        model=cast(Model, None),
+        model=_CompactionModelPlaceholder(),
         messages=messages,
         model_settings=model_settings,
         model_request_parameters=model_request_parameters,
@@ -235,6 +333,34 @@ def get_capability_operation_declaration(
         return collect_capability_operations(capability)[operation]
     except KeyError as exc:
         raise ValueError(f'Capability {type(capability).__name__!r} has no operation {operation!r}.') from exc
+
+
+def reject_unidentified_operation_capabilities(root_capability: AbstractCapability[Any]) -> None:
+    """Run Pydantic AI's capability-identity check ahead of any task registration.
+
+    `BaseDurabilityCapability.for_agent` reaches the same check in
+    `_bind_capability_operations`, which runs only after the engine has bound its
+    toolset, model, and event operations. Every one of those registers a task on the
+    `Workflows` app, and Render's public API cannot unregister a task, so a capability
+    rejected there leaves the app holding a partial, permanent task set. Running the
+    same traversal and the same collector first moves the rejection ahead of the first
+    `app.task` call.
+
+    The message is restated rather than reached through, because the check lives inside
+    the loop that performs the registration. It must be kept identical to the one in
+    `pydantic_ai.durable_exec._base.BaseDurabilityCapability._bind_capability_operations`.
+    """
+    for capability in leaf_capabilities(root_capability):
+        # A capability contributing no durable operations needs no `id`, so the collector
+        # runs first here exactly as it does upstream.
+        if not collect_capability_operations(capability):
+            continue
+        if capability.id is None:
+            raise UserError(
+                f'Capability {type(capability).__name__!r} contributes durable operations and needs an explicit '
+                '`id` because persisted operation identity and worker-side recovery must remain stable. '
+                f"Construct it as `{type(capability).__name__}(id='...')`."
+            )
 
 
 _STR_SET_ADAPTER: TypeAdapter[set[str]] = TypeAdapter(set[str])
@@ -292,11 +418,6 @@ class RenderRunContext(RunContext[AgentDepsT]):
         if name in _GUARDED_FIELDS and name not in object.__getattribute__(self, '__dataclass_fields__'):
             raise UserError(f'{name!r} is not available on {self.__class__.__name__!r} inside a Render child task.')
         return super().__getattribute__(name)
-
-    def _expose_field(self, name: str) -> None:
-        """Mark a framework-restored field as readable inside the child task."""
-        instance_fields = object.__getattribute__(self, '__dataclass_fields__')
-        instance_fields[name] = RunContext.__dataclass_fields__[name]
 
     @property
     def available_tool_names(self) -> set[str]:
@@ -389,9 +510,7 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
         return {
             'version': 1,
             'context': dump_json_object(dict[str, Any], context),
-            'deps': cast(
-                JSONValue, json.loads(json.dumps(JSON_CODEC.dump(self._deps_type, ctx.deps), allow_nan=False))
-            ),
+            'deps': normalize_json_value(JSON_CODEC.dump(self._deps_type, ctx.deps)),
         }
 
     def load(self, payload: JSONObject) -> RunContext[AgentDepsT]:
@@ -428,5 +547,7 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
         """
         if self._model_resolver is None:
             return None
-        model_id = cast('str | None', context.get('_model_id'))
+        model_id = context.get('_model_id')
+        if model_id is not None and not isinstance(model_id, str):
+            raise TypeError('Serialized model ID must be a string or null.')
         return self._model_resolver(model_id)

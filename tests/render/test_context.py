@@ -1,46 +1,55 @@
 from __future__ import annotations
 
-from typing import Any
+import inspect
 
-from render.workflows import TaskDefinition
+import pytest
+from render.workflows import TaskContext, Workflows
 
-from pydantic_ai_harness.render._context import activate_task_context, current_task_context
+from pydantic_ai_harness import RenderWorkflows
 
-
-class StubTaskContext:
-    async def run(self, task: TaskDefinition[..., Any], *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise NotImplementedError
+from .conftest import RecordingTaskContext
 
 
-def test_context_is_owner_scoped_and_nestable() -> None:
-    first_owner = object()
-    second_owner = object()
-    first_context = StubTaskContext()
-    nested_context = StubTaskContext()
-    second_context = StubTaskContext()
+@pytest.mark.anyio
+async def test_public_task_context_is_owner_scoped_and_nestable() -> None:
+    app = Workflows()
+    first = RenderWorkflows[None](app, deps_type=type(None), name='first')
+    second = RenderWorkflows[None](app, deps_type=type(None), name='second')
+    states: list[tuple[bool, bool]] = []
 
-    assert current_task_context(first_owner) is None
-    with activate_task_context(first_owner, first_context):
-        assert current_task_context(first_owner) is first_context
-        assert current_task_context(second_owner) is None
-        with activate_task_context(second_owner, second_context):
-            assert current_task_context(first_owner) is first_context
-            assert current_task_context(second_owner) is second_context
-            with activate_task_context(first_owner, nested_context):
-                assert current_task_context(first_owner) is nested_context
-        assert current_task_context(first_owner) is first_context
-        assert current_task_context(second_owner) is None
-    assert current_task_context(first_owner) is None
+    async def inner_impl(ctx: TaskContext) -> None:
+        del ctx
+        states.append((first.in_durable_context, second.in_durable_context))
+
+    inner = first.task(inner_impl)
+
+    async def outer_impl(ctx: TaskContext) -> None:
+        states.append((first.in_durable_context, second.in_durable_context))
+        await ctx.run(inner)
+        states.append((first.in_durable_context, second.in_durable_context))
+
+    outer = second.task(outer_impl)
+    result = outer.func(RecordingTaskContext())
+    assert inspect.isawaitable(result)
+    await result
+
+    assert states == [(False, True), (True, True), (False, True)]
+    assert first.in_durable_context is False
+    assert second.in_durable_context is False
 
 
-def test_context_resets_after_error() -> None:
-    owner = object()
-    context = StubTaskContext()
+@pytest.mark.anyio
+async def test_public_task_context_resets_after_error() -> None:
+    runtime = RenderWorkflows[None](Workflows(), deps_type=type(None))
 
-    try:
-        with activate_task_context(owner, context):
-            raise RuntimeError('boom')
-    except RuntimeError:
-        pass
+    async def fails_impl(ctx: TaskContext) -> None:
+        del ctx
+        assert runtime.in_durable_context
+        raise RuntimeError('boom')
 
-    assert current_task_context(owner) is None
+    fails = runtime.task(fails_impl)
+    result = fails.func(RecordingTaskContext())
+    assert inspect.isawaitable(result)
+    with pytest.raises(RuntimeError, match='boom'):
+        await result
+    assert runtime.in_durable_context is False

@@ -1,194 +1,114 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any
 
 import pytest
-from pydantic_ai.durable_exec import CapabilityOperationId, RoleBasedOperationConfig
-from pydantic_ai.exceptions import ModelRetry, UserError
-from render.workflows import Options, Retry, TaskDefinition, Workflows
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.models.test import TestModel
+from render.workflows import Options, Retry, TaskContext, Workflows
 
-from pydantic_ai_harness.render._capability import RenderWorkflows
-from pydantic_ai_harness.render._compat import DurableOperation, JSONObject, ParameterTransport
-from pydantic_ai_harness.render._context import current_task_context
-from pydantic_ai_harness.render._operation_backend import RenderBoundOperation, RenderOperationBackend
+from pydantic_ai_harness import RenderWorkflows
 
-
-class ObjectTransport(ParameterTransport[JSONObject, JSONObject]):
-    def dump(self, params: JSONObject) -> JSONObject:
-        return params
-
-    def load(self, payload: JSONObject, *, runtime: object) -> JSONObject:
-        return payload
+from .conftest import RecordingTaskContext
 
 
-class StringCodec:
-    def dump(self, value: str) -> object:
-        return value
-
-    def load(self, payload: object) -> str:
-        if not isinstance(payload, str):
-            raise TypeError('expected a string')
-        return payload
-
-
-class NoCacheIdentity:
-    def project(self, params: JSONObject) -> tuple[object, ...]:
-        return ()
-
-
-class LocalTaskContext:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, object]] = []
-
-    async def run(self, task: TaskDefinition[..., Any], *args: Any, **kwargs: Any) -> Any:
-        assert not kwargs
-        self.calls.append((task.name, args[0]))
-        value = task.func(self, *args)
-        if inspect.isawaitable(value):
-            return await value
-        return value
-
-
-def make_backend(
-    handler: Any,
-    *,
-    options: Options | None = None,
-) -> tuple[RenderWorkflows[object], RenderOperationBackend, RenderBoundOperation[JSONObject, JSONObject, str]]:
+def build_agent(*, options: Options | None = None) -> tuple[Agent[None, str], RenderWorkflows[None]]:
     app = Workflows()
-    runtime = RenderWorkflows[object](app, capability_options=options)
-    config = RoleBasedOperationConfig[Options | None](
-        model=options,
-        event=options,
-        tool=options,
-        capability=options,
+    runtime = RenderWorkflows[None](app, deps_type=type(None), model_options=options)
+    agent = Agent[None, str](
+        TestModel(),
+        name='support',
+        deps_type=type(None),
+        capabilities=[runtime],
     )
-    backend = RenderOperationBackend(app, runtime=runtime, agent_name='support', config=config)
-    operation = DurableOperation[JSONObject, JSONObject, str](
-        operation_id=CapabilityOperationId('demo', operation='execute'),
-        handler=handler,
-        parameter_transport=ObjectTransport(),
-        cache_identity=NoCacheIdentity(),
-        result_codec=StringCodec(),
-        config_role='capability',
-    )
-    bound = backend.bind(operation)
-    assert isinstance(bound, RenderBoundOperation)
-    return runtime, backend, bound
+    return agent, runtime
+
+
+async def _run_in_workflow(agent: Agent[None, str], runtime: RenderWorkflows[None], context: TaskContext) -> str:
+    async def run_agent_impl(ctx: TaskContext) -> str:
+        del ctx
+        return (await agent.run('remote')).output
+
+    run_agent = runtime.task(run_agent_impl)
+    pending = run_agent.func(context)
+    assert inspect.isawaitable(pending)
+    return await pending
 
 
 @pytest.mark.anyio
 async def test_runs_inline_outside_render_context() -> None:
-    async def handler(params: JSONObject) -> str:
-        return str(params['value'])
-
-    _, _, bound = make_backend(handler)
-
-    assert await bound({'value': 'inline'}) == 'inline'
+    agent, runtime = build_agent()
+    assert isinstance((await agent.run('inline')).output, str)
+    assert runtime.in_durable_context is False
 
 
 @pytest.mark.anyio
 async def test_dispatches_registered_task_and_activates_child_context() -> None:
-    runtime: RenderWorkflows[object]
+    agent, runtime = build_agent()
+    context = RecordingTaskContext()
 
-    async def handler(params: JSONObject) -> str:
-        assert current_task_context(runtime._owner_token) is context
-        return str(params['value'])
-
-    runtime, backend, bound = make_backend(handler)
-    context = LocalTaskContext()
-
-    with runtime.activate(context):
-        result = await bound({'value': 'remote'})
-
-    assert result == 'remote'
-    assert context.calls == [
-        (
-            'support__capability__demo.execute',
-            {
-                'version': 1,
-                'operation': 'support__capability__demo.execute',
-                'payload': {'value': 'remote'},
-            },
-        )
-    ]
-    assert bound.task.name == 'support__capability__demo.execute'
-    assert backend.registrations() == []
+    assert isinstance(await _run_in_workflow(agent, runtime, context), str)
+    assert context.task_names == ['support__model.request']
 
 
 @pytest.mark.anyio
-async def test_maps_options_at_registration() -> None:
-    async def handler(params: JSONObject) -> str:
-        return 'ok'
-
-    options = Options(
-        retry=Retry(max_retries=4, wait_duration_ms=250, backoff_scaling=2),
-        timeout_seconds=90,
-        plan='2c-4g',
+async def test_invocation_options_that_differ_from_registration_are_rejected() -> None:
+    runtime = RenderWorkflows[None](
+        Workflows(),
+        deps_type=type(None),
+        tool_options=Options(timeout_seconds=60),
+        resolve_tool_options=lambda operation_id, tool, tool_name: Options(timeout_seconds=120),
     )
-    runtime, _, bound = make_backend(handler, options=options)
-    context = LocalTaskContext()
+    agent = Agent[None, str](
+        TestModel(call_tools=['ping']),
+        name='per-call-options',
+        deps_type=type(None),
+        capabilities=[runtime],
+    )
 
-    task_info = runtime.app._registry.get_task(bound.task.name)
-    assert task_info is not None
-    assert task_info.options == options
+    @agent.tool
+    async def ping(ctx: RunContext[None]) -> str:
+        del ctx
+        return 'pong'
 
-    with runtime.activate(context):
-        with pytest.raises(UserError, match='fixed when an agent is bound'):
-            await bound({}, config=Options(timeout_seconds=1))
-    assert context.calls == []
+    # Render fixes a task's retry, timeout, and plan when the task is registered, so options
+    # resolved later for one tool cannot take effect and are rejected instead of ignored.
+    with pytest.raises(UserError, match='fixed when an agent is bound'):
+        await _run_in_workflow(agent, runtime, RecordingTaskContext())
 
 
 @pytest.mark.anyio
-async def test_registration_snapshots_mutable_options() -> None:
-    async def handler(params: JSONObject) -> str:
-        return 'ok'
+async def test_registered_task_options_are_snapshotted_when_the_agent_is_bound() -> None:
+    """Registration copies the caller's options, so later mutation cannot change a live task.
 
-    options = Options(
-        retry=Retry(max_retries=2, wait_duration_ms=100),
-        timeout_seconds=90,
-        plan='flex',
+    `TaskDefinition` publishes only `name` and `func`, so the registered retry, timeout, and plan
+    cannot be read back through the public Render SDK. The snapshot is observable instead through
+    the invocation check: the resolver hands back the very object that was registered, and the
+    call is rejected only because registration kept a copy of its earlier values.
+    """
+    options = Options(retry=Retry(max_retries=2, wait_duration_ms=100), timeout_seconds=90, plan='flex')
+    runtime = RenderWorkflows[None](
+        Workflows(),
+        deps_type=type(None),
+        tool_options=options,
+        resolve_tool_options=lambda operation_id, tool, tool_name: options,
     )
-    runtime, _, bound = make_backend(handler, options=options)
-    context = LocalTaskContext()
+    agent = Agent[None, str](
+        TestModel(call_tools=['ping']),
+        name='snapshot-options',
+        deps_type=type(None),
+        capabilities=[runtime],
+    )
 
-    options.timeout_seconds = 1
+    @agent.tool
+    async def ping(ctx: RunContext[None]) -> str:
+        del ctx
+        return 'pong'
+
     assert options.retry is not None
     options.retry.max_retries = 99
+    options.timeout_seconds = 1
 
-    task_info = runtime.app._registry.get_task(bound.task.name)
-    assert task_info is not None
-    assert task_info.options.timeout_seconds == 90
-    assert task_info.options.retry is not None
-    assert task_info.options.retry.max_retries == 2
-
-    with runtime.activate(context):
-        with pytest.raises(UserError, match='fixed when an agent is bound'):
-            await bound({}, config=options)
-    assert context.calls == []
-
-
-@pytest.mark.anyio
-async def test_expected_control_flow_crosses_as_tagged_result() -> None:
-    async def handler(params: JSONObject) -> str:
-        raise ModelRetry('choose another value')
-
-    runtime, _, bound = make_backend(handler)
-    context = LocalTaskContext()
-
-    with runtime.activate(context):
-        with pytest.raises(ModelRetry, match='choose another value'):
-            await bound({})
-
-
-@pytest.mark.anyio
-async def test_unexpected_error_is_left_for_render_retry_policy() -> None:
-    async def handler(params: JSONObject) -> str:
-        raise RuntimeError('transient failure')
-
-    runtime, _, bound = make_backend(handler)
-    context = LocalTaskContext()
-
-    with runtime.activate(context):
-        with pytest.raises(RuntimeError, match='transient failure'):
-            await bound({})
+    with pytest.raises(UserError, match='fixed when an agent is bound'):
+        await _run_in_workflow(agent, runtime, RecordingTaskContext())

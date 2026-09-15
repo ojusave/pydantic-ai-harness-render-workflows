@@ -15,18 +15,18 @@ from pydantic_ai.exceptions import (
     SkipToolExecution,
     SkipToolValidation,
     ToolFailed,
+    UserError,
 )
 from pydantic_ai.messages import ModelResponse
 
 from ._compat import JSONObject as JsonObject
 from ._compat import JSONValue as JsonValue
-from ._compat import dump_json_object, load_json_object, load_json_type
+from ._compat import dump_json_object, load_json_object, load_json_type, normalize_json_value
 
 PROTOCOL_VERSION = 1
 MAX_ARGUMENT_BYTES = 4 * 1024 * 1024
 
 _OBJECT_ADAPTER: TypeAdapter[dict[str, object]] = TypeAdapter(dict[str, object])
-_LIST_ADAPTER: TypeAdapter[list[object]] = TypeAdapter(list[object])
 
 
 class OperationRequest(TypedDict):
@@ -47,7 +47,13 @@ class OperationControlFlowError(TypedDict):
     error: JsonObject
 
 
-OperationResult: TypeAlias = OperationSuccess | OperationControlFlowError
+class OperationPermanentError(TypedDict):
+    version: int
+    status: Literal['error']
+    error: JsonObject
+
+
+OperationResult: TypeAlias = OperationSuccess | OperationControlFlowError | OperationPermanentError
 
 
 class RenderProtocolError(ValueError):
@@ -80,8 +86,11 @@ def read_request(value: object, *, expected_operation: str) -> JsonObject:
 
 
 def success(payload: object) -> OperationSuccess:
-    """Build a successful operation result envelope."""
-    return {'version': PROTOCOL_VERSION, 'status': 'ok', 'payload': _as_json_value(payload, label='operation result')}
+    return {
+        'version': PROTOCOL_VERSION,
+        'status': 'ok',
+        'payload': _as_json_value(payload, label='operation result'),
+    }
 
 
 def control_flow_error(exc: Exception) -> OperationControlFlowError | None:
@@ -112,6 +121,13 @@ def control_flow_error(exc: Exception) -> OperationControlFlowError | None:
     return {'version': PROTOCOL_VERSION, 'status': 'control-flow', 'error': error}
 
 
+def permanent_error(kind: Literal['invalid-request', 'invalid-result'], exc: Exception) -> OperationPermanentError:
+    """Finish a task when retrying cannot repair its boundary data."""
+    message = str(exc).strip() or type(exc).__name__
+    error: JsonObject = {'kind': kind, 'message': message[:500]}
+    return {'version': PROTOCOL_VERSION, 'status': 'error', 'error': error}
+
+
 def read_result(value: object) -> JsonValue:
     """Decode a task result, recreating expected Pydantic AI control flow."""
     envelope = _object(value, label='operation result')
@@ -123,6 +139,9 @@ def read_result(value: object) -> JsonValue:
     if status == 'control-flow':
         _check_keys(envelope, required={'version', 'status', 'error'}, label='control-flow operation result')
         _raise_control_flow(envelope['error'])
+    if status == 'error':
+        _check_keys(envelope, required={'version', 'status', 'error'}, label='failed operation result')
+        _raise_permanent_error(envelope['error'])
     raise RenderProtocolError(f'Render operation result has unknown status {status!r}.')
 
 
@@ -160,6 +179,16 @@ def _raise_control_flow(value: object) -> None:
     raise RenderProtocolError(f'Render operation result has unknown control-flow kind {kind!r}.')
 
 
+def _raise_permanent_error(value: object) -> None:
+    error = _object(value, label='operation error')
+    _check_keys(error, required={'kind', 'message'}, label='operation error')
+    kind = error['kind']
+    if kind not in ('invalid-request', 'invalid-result'):
+        raise RenderProtocolError(f'Render operation result has unknown error kind {kind!r}.')
+    message = _string(error['message'], label='operation error message')
+    raise UserError(f'Render operation {kind.replace("-", " ")}: {message}')
+
+
 def _check_argument_size(request: OperationRequest) -> None:
     # TaskContext.run serializes positional arguments as a JSON list. Measure that final shape,
     # including JSON punctuation and whitespace, instead of only measuring the semantic payload.
@@ -171,9 +200,10 @@ def _check_argument_size(request: OperationRequest) -> None:
 
 
 def _as_json_value(value: object, *, label: str) -> JsonValue:
-    encoded = _json_bytes(value, label=label)
-    decoded: object = json.loads(encoded)
-    return _validated_json_value(decoded, label=label)
+    try:
+        return normalize_json_value(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RenderProtocolError(f'{label.capitalize()} must be JSON serializable: {exc}') from exc
 
 
 def _as_json_object(value: object, *, label: str) -> JsonObject:
@@ -184,22 +214,11 @@ def _as_json_object(value: object, *, label: str) -> JsonObject:
 
 
 def _json_bytes(value: object, *, label: str) -> bytes:
+    normalized = _as_json_value(value, label=label)
     try:
-        return json.dumps(value, allow_nan=False).encode()
+        return json.dumps(normalized, allow_nan=False).encode()
     except (OverflowError, TypeError, ValueError) as exc:
         raise RenderProtocolError(f'{label.capitalize()} must be JSON serializable: {exc}') from exc
-
-
-def _validated_json_value(value: object, *, label: str) -> JsonValue:
-    if value is None or isinstance(value, (str, bool, int, float)):
-        return value
-    if isinstance(value, list):
-        items = _LIST_ADAPTER.validate_python(value, strict=True)
-        return [_validated_json_value(item, label=label) for item in items]
-    if isinstance(value, dict):
-        mapping = _OBJECT_ADAPTER.validate_python(value, strict=True)
-        return {key: _validated_json_value(item, label=label) for key, item in mapping.items()}
-    raise RenderProtocolError(f'{label.capitalize()} contains unsupported value {type(value).__name__}.')
 
 
 def _object(value: object, *, label: str) -> dict[str, object]:
