@@ -1,0 +1,61 @@
+name: CLAI 2.0
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ['3.11', '3.14']
+    defaults:
+      run:
+        working-directory: pydantic-clai2
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pyright src tests
+      - run: uv run --no-sync coverage run -m pytest -p no:cacheprovider tests
+        env:
+          COVERAGE_FILE: .coverage.${{ matrix.python }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: clai2-coverage-${{ matrix.python }}
+          path: pydantic-clai2/.coverage.*
+          include-hidden-files: true
+          if-no-files-found: error
+  coverage:
+    name: CLAI coverage
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: pydantic-clai2
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: clai2-coverage-*
+          path: pydantic-clai2/coverage-data
+          merge-multiple: true
+      - run: uv sync --locked
+      - run: uv run --no-sync coverage combine coverage-data
+      - run: uv run --no-sync coverage report
