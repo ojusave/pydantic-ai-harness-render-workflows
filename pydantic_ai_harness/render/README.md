@@ -137,6 +137,12 @@ Its `Spill` mode is the part to design around. A spill writes the full payload t
 
 Inside a workflow, have tools return bounded JSON and keep a large artifact in storage that outlives a single task run: object storage, a database, or another durable service both sides can reach. Return its key and read the artifact back through a tool that fetches it.
 
+## Memory
+
+Pass `Memory(...)` in the agent constructor alongside `RenderWorkflows`. Its static toolset stays registered while each run resolves its own memory scope. Snapshot loading and memory tool calls execute in child tasks.
+
+Use a `MemoryStore` backed by a shared external service that every task instance can reach. The default `InMemoryStore` is process-local; a local file or SQLite database is not shared across hosted task instances. A `store_resolver` and callable `namespace` must reconstruct the same scope from JSON dependencies in each worker. Workflows does not make the memory backend persistent.
+
 ## Task options and tool opt-out
 
 Use Render `Options` for the model, tool, event, and capability task definitions:
@@ -230,7 +236,7 @@ The repository carries an opt-in test that drives the same local runtime end to 
 PYDANTIC_AI_HARNESS_RENDER_LOCAL_RUNTIME=1 uv run pytest tests/render/test_local_runtime.py
 ```
 
-It proves exactly this much: an entry task plus parent, child, and grandchild operation definitions register on a real local Render server; one root task run produces 12 completed operation task runs parented to that root; eight reported operating-system process IDs are distinct; serializable `deps` survive the JSON boundary; sibling child tools return additive usage and ordered events exactly once; and one `ModelRetry` is handled across a grandchild tool-task boundary. It proves nothing about replay, checkpoint resume, or hosted Render behavior.
+It proves exactly this much: an entry task plus parent, child, and grandchild operation definitions register on a real local Render server; one root task run produces 12 completed operation task runs parented to that root; eight reported operating-system process IDs are distinct; serializable `deps` survive the JSON boundary; sibling child tools return additive usage and ordered events exactly once; and one `ModelRetry` is handled across a grandchild tool-task boundary. A second local-runtime case verifies constructor-supplied Memory, write/read calls through separate task processes using a shared local SQLite file, and a custom `ctx.tracer` span reaching the tool worker's exporter. These tests prove nothing about replay, checkpoint resume, or hosted Render behavior. The shared local SQLite file is a test fixture, not a hosted storage design.
 
 ## Streaming and cancellation
 
@@ -243,6 +249,10 @@ Render task-run cancellation remains a native client and control-plane action. P
 Use Render's native SDK and platform behavior for synchronous and asynchronous clients, task queues, retries, timeouts, compute plans, task fan-out, cancellation, and observability. Use a Render cron job when a schedule should trigger a root task run. The registered Pydantic AI operations are ordinary Render tasks and appear in Render's status, logs, metrics, and task views.
 
 The capability emits no additional OpenTelemetry spans. Pydantic AI's model and tool instrumentation continues to trace the agent operations, while Render records the child task runs, retries, logs, and metrics at the workflow boundary.
+
+`ctx.tracer` is available inside child tasks. It is a no-op when tracing is disabled and otherwise uses the worker's Pydantic AI instrumentation settings, including `agent.instrument`, `Agent.instrument_all(...)`, and registered instrumented models. Configure instrumentation when each worker loads the app; tracer objects are not serialized. The caller's `trace_include_content` setting is preserved. This restores tool-local spans but does not propagate OpenTelemetry parent span context across `TaskContext.run`; those spans can be separate traces.
+
+Resolving effective agent/global instrumentation currently uses a private Pydantic AI settings getter inside `_compat.py`, covered by the same version-compatibility tests as context reconstruction.
 
 ## Pydantic AI compatibility boundary
 

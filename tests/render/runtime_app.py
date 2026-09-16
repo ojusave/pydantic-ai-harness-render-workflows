@@ -6,22 +6,39 @@ import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pydantic import BaseModel, TypeAdapter
 from pydantic_ai import Agent, CustomEvent, ModelRetry, RunContext
 from pydantic_ai.capabilities import Hooks
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.usage import RunUsage
 from render.workflows import TaskContext, Workflows
 from typing_extensions import TypedDict
 
 from pydantic_ai_harness import RenderWorkflows
+from pydantic_ai_harness.memory import Memory, SqliteMemoryStore
 from pydantic_ai_harness.subagents import SubAgent, SubAgents
 
 
 class RuntimeDeps(TypedDict):
     prefix: str
     controller_pid: int
+
+
+class MemoryRuntimeDeps(TypedDict):
+    database: str
+    tenant: str
+
+
+class MemoryTaskResult(BaseModel):
+    root_pid: int
+    tool_pid: int
+    content: str
+    span_exported: bool
 
 
 class ToolEvidence(BaseModel):
@@ -252,6 +269,62 @@ async def run_local_runtime_agent(ctx: TaskContext, prompt: str, deps: RuntimeDe
     )
     dumped = TypeAdapter(RootTaskResult).dump_python(payload, mode='json')
     return TypeAdapter(dict[str, object]).validate_python(dumped)
+
+
+def memory_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Write and read memory in separate tasks, then exercise the public tracer."""
+    del info
+    returned = _tool_returns(messages)
+    if trace := returned.get('trace_memory'):
+        return ModelResponse(parts=[TextPart(str(trace.content))])
+    if read := returned.get('read_memory'):
+        return ModelResponse(parts=[ToolCallPart('trace_memory', {'content': str(read.content)})])
+    if 'write_memory' in returned:
+        return ModelResponse(parts=[ToolCallPart('read_memory', {'file': 'MEMORY.md'})])
+    return ModelResponse(parts=[ToolCallPart('write_memory', {'content': 'process-shared memory'})])
+
+
+memory_exporter = InMemorySpanExporter()
+memory_provider = TracerProvider()
+memory_provider.add_span_processor(SimpleSpanProcessor(memory_exporter))
+memory_runtime = RenderWorkflows[MemoryRuntimeDeps](workflows, deps_type=MemoryRuntimeDeps)
+memory_agent = Agent(
+    FunctionModel(memory_model, model_name='runtime-memory-model'),
+    name='runtime-memory',
+    deps_type=MemoryRuntimeDeps,
+    capabilities=[
+        Memory(
+            store_resolver=lambda ctx: SqliteMemoryStore(database=ctx.deps['database']),
+            namespace=lambda ctx: ctx.deps['tenant'],
+        ),
+        memory_runtime,
+    ],
+)
+memory_agent.instrument = InstrumentationSettings(tracer_provider=memory_provider, include_content=False)
+
+
+@memory_agent.tool
+async def trace_memory(ctx: RunContext[MemoryRuntimeDeps], content: str) -> str:
+    """Return evidence that a worker-local span reached its configured exporter."""
+    with ctx.tracer.start_as_current_span('memory.worker') as span:
+        span.set_attribute('worker.pid', os.getpid())
+    return MemoryTaskResult(
+        root_pid=0,
+        tool_pid=os.getpid(),
+        content=content,
+        span_exported=any(span.name == 'memory.worker' for span in memory_exporter.get_finished_spans()),
+    ).model_dump_json()
+
+
+@memory_runtime.task(name='run-local-memory-agent')
+async def run_local_memory_agent(ctx: TaskContext, deps: MemoryRuntimeDeps) -> dict[str, object]:
+    """Exercise memory and tracing with a shared SQLite file in the local runtime."""
+    del ctx
+    validated_deps = TypeAdapter(MemoryRuntimeDeps).validate_python(deps)
+    result = await memory_agent.run('remember and read', deps=validated_deps)
+    evidence = MemoryTaskResult.model_validate_json(result.output)
+    evidence.root_pid = os.getpid()
+    return evidence.model_dump(mode='json')
 
 
 if __name__ == '__main__':

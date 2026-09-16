@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 from pydantic import TypeAdapter
 
+from pydantic_ai_harness.memory import SqliteMemoryStore
+
 from .conftest import LocalRenderRuntime, LocalTaskRun
-from .runtime_app import RootTaskResult
+from .runtime_app import MemoryTaskResult, RootTaskResult
 
 ROOT_TASK = 'run-local-runtime-agent'
 PARENT_MODEL_TASK = 'runtime-parent__model.request'
@@ -92,3 +96,28 @@ def test_nested_agents_run_as_lineaged_local_render_operations(
     assert all(run.status == 'completed' for run in operation_runs)
     assert all(run.root_task_run_id == started.id for run in operation_runs)
     assert all(run.parent_task_run_id == started.id for run in operation_runs)
+
+
+async def test_memory_and_tracer_work_in_separate_render_processes(
+    local_render_runtime: LocalRenderRuntime, tmp_path: Path
+) -> None:
+    runtime = local_render_runtime
+    database = tmp_path / 'memory.sqlite'
+    started = runtime.start_task(
+        'run-local-memory-agent', json.dumps([{'database': str(database), 'tenant': 'local-tenant'}])
+    )
+    completed = runtime.wait_for_run(started.id)
+    assert completed.status == 'completed', runtime.logs()
+    results = TypeAdapter(list[MemoryTaskResult]).validate_python(completed.results)
+    assert len(results) == 1
+    evidence = results[0]
+    assert evidence.content == 'process-shared memory\n'
+    assert evidence.span_exported is True
+    assert len({os.getpid(), evidence.root_pid, evidence.tool_pid}) == 3
+
+    stored = await SqliteMemoryStore(database=database).read('local-tenant/main/MEMORY.md', max_chars=1_000)
+    assert stored is not None and stored.content == evidence.content
+    assert await SqliteMemoryStore(database=database).read('main/MEMORY.md', max_chars=1_000) is None
+    memory_calls = _runs_for_root(runtime, 'runtime-memory__function_toolset__memory.call_tool', started.id)
+    assert len(memory_calls) == 2
+    assert all(run.status == 'completed' for run in memory_calls)

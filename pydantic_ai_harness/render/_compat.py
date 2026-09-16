@@ -1,7 +1,8 @@
 """Compatibility boundary for unpublished Pydantic AI durability semantics.
 
 Cross-process operation parameters, capability ownership, capability-operation
-discovery, and partial `RunContext` reconstruction do not yet have public APIs.
+discovery, effective instrumentation settings, and partial `RunContext`
+reconstruction do not yet have public APIs.
 Their private imports and unavoidable dynamic typing stay here so an upstream
 change has one repair point. Vendor and general framework internals do not belong
 in this module.
@@ -13,7 +14,9 @@ import json
 from abc import ABC
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeAlias, TypeVar, overload, runtime_checkable
 
+from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic import TypeAdapter
+from pydantic_ai import Agent
 from pydantic_ai._run_context import AnchoredEvidence, CapabilityEventT, CustomEventT
 from pydantic_ai.agent.abstract import AbstractAgent
 from pydantic_ai.capabilities.abstract import AbstractCapability, leaf_capabilities
@@ -47,6 +50,7 @@ from pydantic_ai.durable_exec._toolset import (
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import CapabilityEvent, CustomEvent, ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.instrumented import InstrumentedModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext, ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
@@ -441,6 +445,7 @@ class RenderRunContext(RunContext[AgentDepsT]):
 
     def __init__(self, deps: AgentDepsT, **kwargs: Any):
         self.__dict__ = {**kwargs, 'deps': deps}
+        self.__dict__.setdefault('tracer', NoOpTracer())
         for old_name, new_name in _RENAMED_FIELDS:
             if old_name in self.__dict__:
                 self.__dict__.setdefault(new_name, self.__dict__.pop(old_name))
@@ -540,6 +545,7 @@ class RenderRunContext(RunContext[AgentDepsT]):
             'run_step': ctx.run_step,
             'partial_output': ctx.partial_output,
             'trace_include_content': ctx.trace_include_content,
+            'tracer_enabled': not isinstance(ctx.tracer, NoOpTracer),
             'instrumentation_version': ctx.instrumentation_version,
             'usage': ctx.usage,
             'usage_limits': ctx.usage_limits,
@@ -595,13 +601,18 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
             raise TypeError('Render run-context payload requires `deps`.')
 
         context = load_json_object(to_json_object(payload['context']))
+        tracer_enabled = context.pop('tracer_enabled', False)
+        if not isinstance(tracer_enabled, bool):
+            raise TypeError('Serialized tracer enablement must be a boolean.')
+        model = self._resolve_model(context)
+        context['tracer'] = self._resolve_tracer(model) if tracer_enabled else NoOpTracer()
         # The codec validates against the complete type form. A second `isinstance`
         # check would reject valid forms such as `dict[str, str]` and `TypedDict`.
         deps_value = JSON_CODEC.load(self._deps_type, payload['deps'])
         ctx = self._run_context_type.deserialize_run_context(
             context,
             deps=deps_value,
-            model=self._resolve_model(context),
+            model=model,
         )
         if self._agent is not None:
             ctx.__dict__['agent'] = self._agent
@@ -609,6 +620,21 @@ class RenderRunContextCodec(Generic[AgentDepsT]):
             ctx.__dict__['validation_context'] = validation_context_from_agent(self._agent)(ctx)
         ctx.__dict__['pending_messages'] = EnqueueGuard(enqueue_not_supported_message('task', 'workflow'))
         return ctx
+
+    def _resolve_tracer(self, model: Model | None) -> Tracer:
+        """Recover instrumentation from worker configuration, never from the wire."""
+        if isinstance(model, InstrumentedModel):
+            return model.instrumentation_settings.tracer
+        if isinstance(self._agent, Agent):
+            if isinstance(self._agent.model, InstrumentedModel):
+                return self._agent.model.instrumentation_settings.tracer
+            # Core has no public getter for the effective agent/global settings.
+            # Keep that lookup in this compatibility seam instead of duplicating
+            # its precedence or losing Agent.instrument_all's custom provider.
+            settings = self._agent._resolve_instrumentation_settings()  # pyright: ignore[reportPrivateUsage]
+            if settings is not None:
+                return settings.tracer
+        return NoOpTracer()
 
     def _resolve_model(self, context: Mapping[str, Any]) -> Model | None:
         """Resolve the serialized model ID against this worker's registry.
