@@ -5,8 +5,8 @@ import io
 import pytest
 from pydantic_ai import FunctionToolCallEvent
 from pydantic_ai.messages import ToolCallPart
-from pydantic_ai_harness.coder import ShellFinishedEvent, ShellOutputEvent, ShellStartedEvent
 from pydantic_ai_harness.filesystem import FileEditedEvent
+from pydantic_ai_harness.shell import CommandFinishedEvent, CommandOutputEvent, CommandStartedEvent
 from rich.console import Console
 from rich.text import Text
 
@@ -20,7 +20,7 @@ def anyio_backend() -> str:
 
 async def test_shell_header_includes_argument_once() -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None)
+    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None, show_tool_output=True)
     await renderer.on_stream_event(
         FunctionToolCallEvent(
             part=ToolCallPart(
@@ -31,7 +31,7 @@ async def test_shell_header_includes_argument_once() -> None:
         )
     )
     await renderer.on_stream_event(
-        ShellStartedEvent(
+        CommandStartedEvent(
             tool_call_id='shell-call',
             command='ls /tmp',
             pid=1,
@@ -43,10 +43,12 @@ async def test_shell_header_includes_argument_once() -> None:
 async def test_shell_sgr_colors_across_chunks_and_lines() -> None:
     output = io.StringIO()
     renderer = StreamRenderer(
-        Console(file=output, force_terminal=True, color_system='truecolor'), stop_loading=lambda: None
+        Console(file=output, force_terminal=True, color_system='truecolor'),
+        stop_loading=lambda: None,
+        show_tool_output=True,
     )
     for chunk in ('\x1b[1;', '35mMAGENTA\n', 'STILL MAGENTA\x1b[0m\n', '\x1b[2J\x1b]52;c;payload\x07safe\n'):
-        await renderer.on_stream_event(ShellOutputEvent(tool_call_id='colors', text=chunk))
+        await renderer.on_stream_event(CommandOutputEvent(tool_call_id='colors', text=chunk))
     rendered = output.getvalue()
     plain = Text.from_ansi(rendered).plain
     assert 'MAGENTA\nSTILL MAGENTA' in plain
@@ -76,18 +78,18 @@ async def test_shell_sgr_colors_across_chunks_and_lines() -> None:
 )
 async def test_inspection_headers(name: str, args: dict[str, object], expected: str) -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output, width=160), stop_loading=lambda: None)
+    renderer = StreamRenderer(Console(file=output, width=160), stop_loading=lambda: None, show_tool_output=True)
     await renderer.on_stream_event(FunctionToolCallEvent(part=ToolCallPart(name, args, tool_call_id='inspect')))
     assert output.getvalue() == expected + '\n\n'
 
 
 async def test_shell_event_display() -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None)
-    await renderer.on_stream_event(ShellStartedEvent(tool_call_id='1', command='printf hello', pid=12))
-    await renderer.on_stream_event(ShellOutputEvent(tool_call_id='1', text='hello\x1b]52;c;payload\x07'))
+    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None, show_tool_output=True)
+    await renderer.on_stream_event(CommandStartedEvent(tool_call_id='1', command='printf hello', pid=12))
+    await renderer.on_stream_event(CommandOutputEvent(tool_call_id='1', text='hello\x1b]52;c;payload\x07'))
     await renderer.on_stream_event(
-        ShellFinishedEvent(
+        CommandFinishedEvent(
             tool_call_id='1',
             pid=12,
             output_path='/tmp/output.log',
@@ -105,11 +107,11 @@ async def test_shell_event_display() -> None:
 @pytest.mark.parametrize('limit', [0, 1, 2])
 async def test_shell_line_limit_across_chunks(limit: int) -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None, shell_lines=limit)
+    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None, show_tool_output=True, shell_lines=limit)
     for chunk in ('fir', 'st\nsecond', '\nthird\nfourth'):
-        await renderer.on_stream_event(ShellOutputEvent(tool_call_id='test', text=chunk))
+        await renderer.on_stream_event(CommandOutputEvent(tool_call_id='test', text=chunk))
     await renderer.on_stream_event(
-        ShellFinishedEvent(
+        CommandFinishedEvent(
             tool_call_id='test',
             pid=1,
             output_path='/tmp/out',
@@ -128,18 +130,18 @@ async def test_shell_line_limit_across_chunks(limit: int) -> None:
 
 async def test_shell_progress_replaces_carriage_return_frames() -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output, width=80), stop_loading=lambda: None)
+    renderer = StreamRenderer(Console(file=output, width=80), stop_loading=lambda: None, show_tool_output=True)
     await renderer.on_stream_event(
-        ShellStartedEvent(
+        CommandStartedEvent(
             tool_call_id='progress',
             command='python3 - <<PY\nprint(123)\nPY',
             pid=1,
         )
     )
     for chunk in ('header\r', '\n10%', '\r50%', '\r', '100%\n', 'done'):
-        await renderer.on_stream_event(ShellOutputEvent(tool_call_id='progress', text=chunk))
+        await renderer.on_stream_event(CommandOutputEvent(tool_call_id='progress', text=chunk))
     await renderer.on_stream_event(
-        ShellFinishedEvent(
+        CommandFinishedEvent(
             tool_call_id='progress',
             pid=1,
             output_path='/tmp/out',
@@ -158,7 +160,9 @@ async def test_shell_progress_replaces_carriage_return_frames() -> None:
 
 async def test_edit_uses_termflow_diff_renderer() -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output, force_terminal=True), stop_loading=lambda: None)
+    renderer = StreamRenderer(
+        Console(file=output, force_terminal=True), stop_loading=lambda: None, show_tool_output=True
+    )
     await renderer.on_stream_event(
         FileEditedEvent(
             path='demo.py',

@@ -17,17 +17,30 @@ from pydantic_ai import (
     ThinkingPartDelta,
 )
 from rich.console import Console, RenderableType
+from rich.style import Style
+from rich.syntax import Syntax
+from rich.text import Text
 from termflow import Parser, Renderer  # pyright: ignore[reportMissingTypeStubs]
+from termflow.parser.events import (  # pyright: ignore[reportMissingTypeStubs]
+    CodeBlockEndEvent,
+    CodeBlockLineEvent,
+    CodeBlockStartEvent,
+    ParseEvent,
+)
 from termflow.render.style import RenderFeatures, RenderStyle  # pyright: ignore[reportMissingTypeStubs]
-from termflow.stream import SmoothWriter, StreamSmoother  # pyright: ignore[reportMissingTypeStubs]
+from termflow.stream import SmoothWriter  # pyright: ignore[reportMissingTypeStubs]
+from termflow.syntax import LANGUAGE_ALIASES  # pyright: ignore[reportMissingTypeStubs]
 
 from . import theme
 from .grep_output import GrepOutput
-from .tool_output import ToolOutput, terminal_text
+from .tool_output import ToolOutput, print_tool_header, terminal_text
 
 
 def markdown_style() -> RenderStyle:
-    """Termflow palette from the brand guide: Lithium headings, Calcium markers, Aqua links."""
+    """Keep the existing Markdown colours unless a Termflow palette is selected."""
+    palette = theme.current()
+    if palette is not None:
+        return palette.to_render_style()
     return RenderStyle(
         bright=theme.LITHIUM,
         head=theme.PURPLE,
@@ -42,7 +55,7 @@ def markdown_style() -> RenderStyle:
 
 
 class StreamRenderer:
-    """Render text and thinking separately, flushing Markdown at part boundaries."""
+    """Stream text and dimmed reasoning through the same Markdown pipeline."""
 
     def __init__(
         self,
@@ -51,24 +64,27 @@ class StreamRenderer:
         stop_loading: Callable[[], None],
         show_thinking: bool = True,
         smooth_seconds: float = 0.5,
+        show_tool_output: bool = False,
         shell_lines: int = 20,
         grep_lines: int = 20,
         renderers: Sequence[Callable[[AgentStreamEvent], RenderableType | None]] = (),
     ) -> None:
         self.console = console
         self._renderers = tuple(renderers)
-        self._tool_output = ToolOutput(console, shell_lines=shell_lines)
-        self._grep_output = GrepOutput(console, lines=grep_lines)
+        self.show_tool_output = show_tool_output
+        self._tool_output = ToolOutput(console, shell_lines=shell_lines, show_output=show_tool_output)
+        self._grep_output = GrepOutput(console, lines=grep_lines, show_output=show_tool_output)
         self.smooth_seconds = smooth_seconds
         self._thinking = False
         self._heading_printed = False
         self.show_thinking = show_thinking
         self.stop_loading = stop_loading
         self._writer: SmoothWriter | None = None
-        self._thinking_writer: StreamSmoother | None = None
         self._parser: Parser | None = None
         self._renderer: Renderer | None = None
         self._buffer = ''
+        self._code_lines: list[str] = []
+        self._code_language = 'text'
         self._index: int | None = None
         self.rendered_text = False
 
@@ -117,10 +133,7 @@ class StreamRenderer:
             return
         if isinstance(event, FunctionToolCallEvent) and not self._tool_output.render_call(event):
             name = ''.join(char if char.isprintable() else ' ' for char in event.part.tool_name)
-            self.console.print(
-                f'● {name}', style=theme.MUTED, markup=False, highlight=False, overflow='ellipsis', no_wrap=True
-            )
-            self.console.print()
+            print_tool_header(self.console, name=name)
 
     async def _render_with_plugins(self, event: AgentStreamEvent) -> bool:
         for renderer in self._renderers:
@@ -134,41 +147,33 @@ class StreamRenderer:
         return False
 
     def _start_part(self) -> None:
-        if self._thinking:
-            if self.console.is_terminal:
-                self._thinking_writer = StreamSmoother(
-                    self._emit_thinking, tick_interval=0.02, catch_up_seconds=0.4, min_chars_per_tick=2
-                )
-                self._thinking_writer.start()
-            return
         self._parser = Parser()
         if self.console.is_terminal:
-            self._writer = SmoothWriter(
-                self.console.file, tick_interval=0.012, catch_up_seconds=self.smooth_seconds, min_chars_per_tick=1
-            )
+            self._writer = self._make_writer()
             self._writer.start()
         self._renderer = Renderer(
             output=self._writer or self.console.file,  # pyright: ignore[reportArgumentType]
             width=self.console.width,
             style=markdown_style(),
             features=RenderFeatures(clipboard=False, hyperlinks=False, images=False),
+            dim=self._thinking,
         )
 
-    def _emit_thinking(self, content: str) -> None:
-        self.console.print(content, style=theme.MUTED, end='', markup=False, highlight=False)
+    def _make_writer(self) -> SmoothWriter:
+        """Reasoning keeps Code Puppy's slower thinking pace; responses use the configured catch-up."""
+        if self._thinking:
+            return SmoothWriter(self.console.file, tick_interval=0.02, catch_up_seconds=0.4, min_chars_per_tick=2)
+        return SmoothWriter(
+            self.console.file, tick_interval=0.012, catch_up_seconds=self.smooth_seconds, min_chars_per_tick=1
+        )
 
     def _feed(self, content: str) -> None:
         content = terminal_text(content)
         if content and not self._heading_printed:
             if self._thinking:
-                self.console.print('Thinking', style=theme.THINKING)
+                # No newline: the rendered reasoning continues on the heading's line.
+                self.console.print('Thinking ', style=theme.color(theme.THINKING), end='')
             self._heading_printed = True
-        if self._thinking:
-            if self._thinking_writer is not None:
-                self._thinking_writer.feed(content)
-            else:
-                self._emit_thinking(content)
-            return
         self._buffer += content
         while '\n' in self._buffer:
             line, self._buffer = self._buffer.split('\n', 1)
@@ -176,25 +181,47 @@ class StreamRenderer:
 
     def _line(self, line: str) -> None:
         assert self._parser is not None and self._renderer is not None
-        self._renderer.render_all(self._parser.parse_line(line))
+        self._render_events(self._parser.parse_line(line))
+
+    def _render_events(self, events: list[ParseEvent]) -> None:
+        assert self._renderer is not None
+        for event in events:
+            if isinstance(event, CodeBlockStartEvent):
+                self._code_language = (event.language or 'text').split()[0]
+                self._code_lines = []
+            elif isinstance(event, CodeBlockLineEvent):
+                self._code_lines.append(event.line)
+            elif isinstance(event, CodeBlockEndEvent):
+                # Lex the whole fence so multiline strings and comments keep their state.
+                with self.console.capture() as capture:
+                    self.console.rule(Text(self._code_language), align='left', style=theme.color(theme.MUTED))
+                    self.console.print(
+                        Syntax(
+                            '\n'.join(self._code_lines),
+                            LANGUAGE_ALIASES.get(self._code_language.lower(), self._code_language.lower()),
+                            theme=theme.syntax_theme(),
+                            background_color='default',
+                            word_wrap=True,
+                        ),
+                        style=Style(dim=self._thinking),
+                    )
+                    self.console.rule(style=theme.color(theme.MUTED))
+                (self._writer or self.console.file).write(capture.get())
+                self._code_lines = []
+            else:
+                self._renderer.render(event)
 
     async def finish(self) -> None:
         """Drain rendered Markdown before the next part, tool, or prompt appears."""
         if self._buffer:
             self._line(self._buffer)
         if self._parser is not None and self._renderer is not None:
-            self._renderer.render_all(self._parser.finalize())
+            self._render_events(self._parser.finalize())
         writer, self._writer = self._writer, None
-        thinking_writer, self._thinking_writer = self._thinking_writer, None
         visible = self._heading_printed
-        thinking_visible = self._thinking and visible
         self._reset()
         if writer is not None:
             await writer.close()
-        if thinking_writer is not None:
-            await thinking_writer.close()
-        if thinking_visible:
-            self.console.print()
         if visible:
             self.console.print()
         self.console.file.flush()
@@ -203,15 +230,14 @@ class StreamRenderer:
         """Discard pending output on cancellation and let the drainer terminate."""
         self._tool_output.abort()
         writer, self._writer = self._writer, None
-        thinking_writer, self._thinking_writer = self._thinking_writer, None
         self._reset()
         if writer is not None:
             writer.abort()
-        if thinking_writer is not None:
-            thinking_writer.abort()
         await asyncio.sleep(0)
 
     def _reset(self) -> None:
+        self._code_lines = []
+        self._code_language = 'text'
         self._heading_printed = False
         self._buffer = ''
         self._parser = None

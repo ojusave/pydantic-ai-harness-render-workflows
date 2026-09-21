@@ -11,6 +11,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Generic
 
+from anyio import fail_after
+from anyio.lowlevel import checkpoint
 from pydantic_ai import AgentStreamEvent
 from pydantic_ai.capabilities import AbstractCapability, AgentCapability
 from rich.console import Console
@@ -18,8 +20,21 @@ from rich.console import Console
 from . import theme
 from .commands import Commands, plugins_command
 from .config import PluginSettings
-from .plugins import DepsT, HostEvent, PluginHost, Renderer, SessionEnd, SessionEndReason, SessionStart, TurnStart
+from .plugins import (
+    Conversation,
+    DepsT,
+    FullScreen,
+    HostEvent,
+    PluginHost,
+    Renderer,
+    SessionEnd,
+    SessionEndReason,
+    SessionStart,
+    TurnStart,
+    bare_screen,
+)
 from .settings_store import SettingsStore
+from .status import Status, StatusSegment
 
 _FOLDER_PACKAGE = 'pydantic_clai2_plugins'
 
@@ -41,6 +56,7 @@ class PluginEntry(Generic[DepsT]):
     declaration: PluginSettings
     path: Path | None
     builtin: bool = False
+    project: bool = False
     host: PluginHost[DepsT] | None = None
     error: str | None = None
 
@@ -50,10 +66,17 @@ class PluginEntry(Generic[DepsT]):
         return self.declaration.id
 
     @property
+    def shipped(self) -> bool:
+        """Declared by CLAI or the project file, so `add` replaces it and `remove` restores it."""
+        return self.builtin or self.project
+
+    @property
     def source(self) -> str:
         """The file path for drop-in plugins, otherwise the import string."""
         if self.path is not None:
             return str(self.path)
+        if self.project:
+            return f'{self.declaration.factory} (project)'
         return f'{self.declaration.factory} (built-in)' if self.builtin else self.declaration.factory
 
     @property
@@ -77,13 +100,25 @@ class PluginLoader(Generic[DepsT]):
         commands: Commands,
         session_start: Callable[[], SessionStart],
         builtin: Sequence[PluginSettings] = (),
+        project: Sequence[PluginSettings] = (),
+        conversation: Conversation | None = None,
+        status: Status | None = None,
+        full_screen: FullScreen = bare_screen,
     ) -> None:
-        """`builtin` declarations ship with CLAI and are on unless the store says otherwise."""
+        """`builtin` ships with CLAI, `project` comes from `.clai/settings.json`; the store overrides both.
+
+        `full_screen` is handed to every host; the shell binds it to the live renderer per prompt.
+        `conversation` and `status` are handed to every host; see `PluginHost` for the defaults.
+        """
         self._store = store
         self._console = console
         self._commands = commands
         self._session_start = session_start
+        self._full_screen = full_screen
+        self._conversation = conversation
+        self._status = status
         self._builtin = {declaration.id: declaration for declaration in builtin}
+        self._project = {declaration.id: declaration for declaration in project}
         self._entries: dict[str, PluginEntry[DepsT]] = {}
         self._loaded: dict[str, PluginHost[DepsT]] = {}
 
@@ -98,8 +133,9 @@ class PluginLoader(Generic[DepsT]):
         declared = {declaration.id: declaration for declaration in self._store.plugins()}
         for name in folder.keys() - declared.keys():
             declared[name] = PluginSettings(id=name, factory=name, path=str(folder[name]))
-        for name in self._builtin.keys() - declared.keys():
-            declared[name] = self._builtin[name]
+        for shipped in (self._project, self._builtin):
+            for name in shipped.keys() - declared.keys():
+                declared[name] = shipped[name]
         refreshed: dict[str, PluginEntry[DepsT]] = {}
         for name in sorted(declared):
             previous = self._entries.get(name)
@@ -107,7 +143,8 @@ class PluginLoader(Generic[DepsT]):
             refreshed[name] = PluginEntry(
                 declaration=declared[name],
                 path=Path(path) if path is not None else None,
-                builtin=declared[name].model_copy(update={'enabled': True}) == self._builtin.get(name),
+                builtin=_same_plugin(declared[name], self._builtin.get(name)),
+                project=_same_plugin(declared[name], self._project.get(name)),
                 host=previous.host if previous else None,
                 error=previous.error if previous else None,
             )
@@ -117,6 +154,19 @@ class PluginLoader(Generic[DepsT]):
         self._entries = refreshed
         return list(refreshed.values())
 
+    def _registration_order(self) -> list[PluginEntry[DepsT]]:
+        """Shipped plugins first, in declaration order, then everything else by name.
+
+        `entries()` sorts by name so the menu and `/plugins list` are easy to scan, but that sort
+        must not decide which instructions, renderer, or status segment comes first: alphabetical
+        order put `ask_user`'s guidance ahead of `coder`'s. Claiming a built-in's id still counts
+        as shipped, so a replaced declaration keeps its position.
+        """
+        entries = self.entries()
+        order = {name: index for index, name in enumerate(self._builtin)}
+        shipped = sorted((entry for entry in entries if entry.name in order), key=lambda entry: order[entry.name])
+        return [*shipped, *(entry for entry in entries if entry.name not in order)]
+
     def _discover(self) -> dict[str, Path]:
         folder = self._store.plugins_dir
         if not folder.is_dir():
@@ -125,7 +175,7 @@ class PluginLoader(Generic[DepsT]):
         try:
             children = sorted(folder.iterdir())
         except OSError as exc:
-            self._console.print(f'Cannot discover plugins: {exc}', style=theme.ERROR, markup=False)
+            self._console.print(f'Cannot discover plugins: {exc}', style=theme.color(theme.ERROR), markup=False)
             return {}
         for child in children:
             name = child.stem if child.suffix == '.py' else child.name
@@ -151,21 +201,32 @@ class PluginLoader(Generic[DepsT]):
         """Consulted before the default display, in load order."""
         return [renderer for host in self._loaded.values() for renderer in host.renderers]
 
-    async def load_all(self) -> None:
-        """Load every enabled plugin at startup, reporting failures without stopping."""
-        for entry in self.entries():
+    def status_segments(self) -> list[StatusSegment]:
+        """Appended to the status row, in load order."""
+        return [segment for host in self._loaded.values() for segment in host.status_segments]
+
+    async def load_all(self, *, fresh: bool = False) -> None:
+        """Load enabled plugins, re-importing after a shell reload so host event types match."""
+        for entry in self._registration_order():
             if entry.declaration.enabled and entry.host is None:
                 try:
-                    await self.load(entry.name)
+                    await self.load(entry.name, fresh=fresh)
                 except PluginError as exc:
-                    self._console.print(str(exc), style=theme.ERROR, markup=False)
+                    self._console.print(str(exc), style=theme.color(theme.ERROR), markup=False)
 
     async def load(self, name: str, *, fresh: bool = False) -> None:
         """Import, activate, and fire `session_start`. A failure leaves nothing registered."""
         entry = self._entry(name)
         if entry.host is not None:
             return
-        host = PluginHost[DepsT](name=name, console=self._console, settings=entry.declaration.settings)
+        host = PluginHost[DepsT](
+            name=name,
+            console=self._console,
+            settings=entry.declaration.settings,
+            full_screen=self._full_screen,
+            conversation=self._conversation,
+            status=self._status,
+        )
         try:
             module = self._import(entry, fresh=fresh)
             _activate(module, entry.declaration, host)
@@ -174,13 +235,33 @@ class PluginLoader(Generic[DepsT]):
             self._loaded[name] = host
             await _dispatch(host, self._session_start())
         except asyncio.CancelledError:
-            self._drop(entry)
+            await self._failed_load(entry, host)
             raise
         except Exception as exc:
-            self._drop(entry)
+            await self._failed_load(entry, host)
             entry.error = f'{type(exc).__name__}: {exc}'
             raise PluginError(name, exc) from exc
         entry.error = None
+
+    async def _failed_load(self, entry: PluginEntry[DepsT], host: PluginHost[DepsT]) -> None:
+        task = asyncio.current_task()
+        initial_cancellations = task.cancelling() if task is not None else 0
+        try:
+            for handler in host.handlers:
+                try:
+                    with fail_after(5, shield=True):
+                        await handler(SessionEnd(reason='error'))
+                except (Exception, asyncio.CancelledError) as exc:
+                    if (
+                        isinstance(exc, asyncio.CancelledError)
+                        and task is not None
+                        and task.cancelling() > initial_cancellations
+                    ):
+                        raise
+                    self._console.print(str(PluginError(entry.name, exc)), style=theme.color(theme.ERROR), markup=False)
+        finally:
+            self._drop(entry)
+        await checkpoint()
 
     async def unload(self, name: str, *, reason: SessionEndReason = 'exit') -> None:
         """Fire `session_end`, then drop everything the plugin registered."""
@@ -190,7 +271,7 @@ class PluginLoader(Generic[DepsT]):
         try:
             await _dispatch(entry.host, SessionEnd(reason=reason))
         except Exception as exc:  # noqa: BLE001 -- unloading must finish even if the plugin misbehaves.
-            self._console.print(str(PluginError(name, exc)), style=theme.ERROR, markup=False)
+            self._console.print(str(PluginError(name, exc)), style=theme.color(theme.ERROR), markup=False)
         finally:
             self._drop(entry)
 
@@ -213,7 +294,7 @@ class PluginLoader(Generic[DepsT]):
             except Exception as exc:
                 if isinstance(event, TurnStart):
                     raise PluginError(name, exc) from exc
-                self._console.print(str(PluginError(name, exc)), style=theme.ERROR, markup=False)
+                self._console.print(str(PluginError(name, exc)), style=theme.color(theme.ERROR), markup=False)
 
     async def enable(self, name: str) -> None:
         """Remember the plugin as enabled and load it now."""
@@ -228,17 +309,20 @@ class PluginLoader(Generic[DepsT]):
         self._store.save_plugin(entry.declaration.model_copy(update={'enabled': False}))
 
     async def remove(self, name: str) -> str:
-        """Unload the plugin and forget its saved declaration."""
+        """Unload the plugin and forget its saved declaration; a shipped declaration comes back as declared."""
         entry = self._entry(name)
         await self.unload(name)
-        if entry.path is not None:
+        if entry.path is not None and not entry.shipped:
             self._store.save_plugin(entry.declaration.model_copy(update={'enabled': False}))
             return f'Disabled {name}. Delete {entry.path} to remove the plugin itself.'
         self._store.delete_plugin(name)
-        if name in self._builtin:
+        shipped = self._project.get(name) or self._builtin.get(name)
+        if shipped is None:
+            return f'Removed {name}.'
+        if shipped.enabled:
             await self.load(name)
-            return f'{name} is built in; restored its defaults. Use /plugins disable {name} to turn it off.'
-        return f'Removed {name}.'
+        origin = 'declared by the project' if name in self._project else 'built in'
+        return f'{name} is {origin}; restored its defaults. Use /plugins disable {name} to turn it off.'
 
     async def reload(self, name: str) -> None:
         """Unload, re-import the module, and load again."""
@@ -256,13 +340,15 @@ class PluginLoader(Generic[DepsT]):
         action, *rest = args
         if action == 'add':
             existing = next((entry for entry in self.entries() if rest and entry.name == rest[0]), None)
-            if existing is not None and not existing.builtin:
+            if existing is not None and not existing.shipped:
                 raise ValueError(f'Plugin {rest[0]} already exists; remove its declaration before replacing it.')
             if existing is not None:
                 await self.unload(rest[0])
             plugins_command(self._store, args)
             await self.load(rest[0])
-            return f'Replaced built-in {rest[0]}.' if existing is not None else f'Added and loaded {rest[0]}.'
+            if existing is None:
+                return f'Added and loaded {rest[0]}.'
+            return f'Replaced {"project" if existing.project else "built-in"} {rest[0]}.'
         if len(rest) != 1:
             raise ValueError(
                 'Usage: /plugins [list|add ID MODULE[:ATTR] [JSON]|enable ID|disable ID|remove ID|reload ID]'
@@ -287,6 +373,13 @@ class PluginLoader(Generic[DepsT]):
         module_name = entry.declaration.factory.partition(':')[0]
         module = importlib.import_module(module_name)
         return importlib.reload(module) if fresh else module
+
+
+def _same_plugin(declaration: PluginSettings, shipped: PluginSettings | None) -> bool:
+    """Whether `declaration` is `shipped` itself, or the store's enabled or disabled copy of it."""
+    if shipped is None:
+        return False
+    return declaration.model_copy(update={'enabled': True}) == shipped.model_copy(update={'enabled': True})
 
 
 def _import_file(name: str, path: Path) -> ModuleType:

@@ -6,14 +6,22 @@ from typing import get_args
 
 import pytest
 from pydantic import BaseModel, JsonValue, ValidationError
-from pydantic_ai import Agent, CapabilityEvent, FunctionToolCallEvent, RunContext, ToolCallPart, ToolDefinition
+from pydantic_ai import (
+    Agent,
+    CapabilityEvent,
+    FunctionToolCallEvent,
+    ModelRequest,
+    RunContext,
+    ToolCallPart,
+    ToolDefinition,
+)
 from pydantic_ai.capabilities import Capability, Hooks, ValidatedToolArgs
 from pydantic_ai.models.test import TestModel
 from rich.console import Console
 
 from pydantic_clai2 import Session, StreamRenderer
 from pydantic_clai2.commands import Command
-from pydantic_clai2.plugins import CoreHookName, PluginHost, SessionEnd, SessionStart, TurnEnd, TurnStart
+from pydantic_clai2.plugins import CoreHookName, PluginHost, SessionEnd, SessionStart, Transcript, TurnEnd, TurnStart
 from pydantic_clai2.settings_store import SettingsStore
 
 
@@ -83,7 +91,7 @@ async def test_host_hooks_dispatch_by_event_type() -> None:
             await handler(event)
     assert seen == ['start:openai-codex:gpt-6-astra', 'turn:hi', 'done:completed', 'end:eof']
     assert plugin.capabilities == []
-    assert plugin.summary() == '0 commands, 4 hooks, 0 capabilities, 0 renderers'
+    assert plugin.summary() == '0 commands, 4 hooks, 0 capabilities, 0 renderers, 0 status segments'
 
 
 async def test_core_hooks_events_tools_and_renderers_reach_the_run() -> None:
@@ -114,7 +122,9 @@ async def test_core_hooks_events_tools_and_renderers_reach_the_run() -> None:
     def draw(event: FunctionToolCallEvent) -> str:
         return f'drew {event.part.tool_name}'
 
-    assert plugin.summary() == '1 commands, 0 hooks, 1 capabilities, 1 renderers'
+    assert plugin.status_segment(lambda: 'here')() == 'here'
+
+    assert plugin.summary() == '1 commands, 0 hooks, 1 capabilities, 1 renderers, 1 status segments'
     assert len(plugin.capabilities) == 2
     session = Session(Agent(TestModel(call_tools=['shout'])), deps=None, plugins=plugin.capabilities)
     await session.prompt('hello')
@@ -139,3 +149,14 @@ async def test_plugin_renderers_run_before_the_default_display() -> None:
     assert 'custom mine' in output.getvalue()
     assert 'custom theirs' not in output.getvalue()
     assert '● theirs' in output.getvalue()
+
+
+def test_transcript_hands_out_snapshots_like_session() -> None:
+    first = ModelRequest.user_text_prompt('one')
+    transcript = Transcript(messages=[first], model='test')
+    transcript.messages.append(ModelRequest.user_text_prompt('sneaky'))
+    assert transcript.messages == [first]
+    second = ModelRequest.user_text_prompt('two')
+    transcript.replace_messages([second])
+    assert transcript.messages == [second]
+    assert host().conversation.messages == []

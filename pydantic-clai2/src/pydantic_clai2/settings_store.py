@@ -32,6 +32,7 @@ class SettingsStore:
             connection.execute(
                 'CREATE TABLE IF NOT EXISTS model_settings (model TEXT PRIMARY KEY, settings_json TEXT NOT NULL)'
             )
+            connection.execute('CREATE TABLE IF NOT EXISTS models (name TEXT PRIMARY KEY)')
             connection.execute('PRAGMA user_version = 1')
 
     @contextmanager
@@ -44,11 +45,12 @@ class SettingsStore:
             connection.close()
 
     def overrides(self) -> dict[str, JsonValue]:
-        """Read explicit preferences, validating the serialized values."""
+        """Read recognized preferences without modifying unknown stored entries."""
         with self._connect() as connection:
             return {
                 key: _JSON.validate_json(value)
                 for key, value in connection.execute('SELECT key, value_json FROM settings')
+                if key in SETTING_FIELDS
             }
 
     def load(self) -> Settings:
@@ -63,6 +65,19 @@ class SettingsStore:
                 'INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json',
                 (key, _JSON.dump_json(value).decode()),
             )
+
+            if key == 'model' and isinstance(value, str):
+                connection.execute('INSERT OR IGNORE INTO models VALUES (?)', (value,))
+
+    def models(self) -> list[str]:
+        """Models explicitly saved for reuse, in name order."""
+        with self._connect() as connection:
+            return [row[0] for row in connection.execute('SELECT name FROM models ORDER BY name')]
+
+    def add_model(self, *, name: str) -> None:
+        """Remember a model without changing the active preference."""
+        with self._connect() as connection:
+            connection.execute('INSERT OR IGNORE INTO models VALUES (?)', (name,))
 
     def reset(self, key: str) -> None:
         """Remove a setting override, restoring its default."""

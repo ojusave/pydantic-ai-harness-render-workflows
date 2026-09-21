@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel
 from pydantic_ai import AgentStreamEvent, FunctionToolCallEvent
-from pydantic_ai_harness.coder import ShellFinishedEvent, ShellOutputEvent, ShellStartedEvent
 from pydantic_ai_harness.filesystem import FileChangeRequestEvent, FileEditedEvent, FileWrittenEvent
+from pydantic_ai_harness.shell import CommandFinishedEvent, CommandOutputEvent, CommandStartedEvent
 from rich.ansi import AnsiDecoder
 from rich.console import Console
 from rich.text import Text
@@ -18,6 +18,16 @@ from . import theme
 def terminal_text(text: str) -> str:
     """Make untrusted control characters inert before terminal rendering."""
     return ''.join(char if char.isprintable() or char in '\n\t' else f'\\x{ord(char):02x}' for char in text)
+
+
+def print_tool_header(console: Console, *, name: str, argument: str = '') -> None:
+    """Highlight the tool name, leaving its marker and arguments muted."""
+    text = Text('● ', style=theme.color(theme.MUTED))
+    text.append(terminal_text(name), style=theme.color(theme.ACCENT))
+    if argument:
+        text.append(f' {terminal_text(argument)}', style=theme.color(theme.MUTED))
+    console.print(text, overflow='ellipsis', no_wrap=True)
+    console.print()
 
 
 _SGR = re.compile(r'(\x1b\[[0-9;]*m)')
@@ -59,10 +69,11 @@ class ShellPreview:
 class ToolOutput:
     """Present bounded shell chunks and Termflow-highlighted file diffs."""
 
-    def __init__(self, console: Console, *, shell_lines: int = 20) -> None:
+    def __init__(self, console: Console, *, shell_lines: int = 20, show_output: bool = False) -> None:
         """Use the conversation's output stream, not global stdout."""
         self.console = console
         self.shell_lines = shell_lines
+        self.show_output = show_output
         self._shells: dict[str | None, ShellPreview] = {}
         self._headers: set[tuple[str | None, str]] = set()
         self._writes: dict[tuple[str | None, str, str], FileChangeRequestEvent] = {}
@@ -72,10 +83,7 @@ class ToolOutput:
         summary = lines[0] if lines else ''
         if len(lines) > 1:
             summary += f' (+{len(lines) - 1} command lines)'
-        text = Text(f'● {name} ', style=theme.MUTED)
-        text.append(terminal_text(summary), style=theme.ACCENT)
-        self.console.print(text, overflow='ellipsis', no_wrap=True)
-        self.console.print()
+        print_tool_header(self.console, name=name, argument=summary)
 
     def render_call(self, event: FunctionToolCallEvent) -> bool:
         """Show arguments once, before execution, including for failed calls."""
@@ -113,7 +121,7 @@ class ToolOutput:
         self._header(name, f'{path!r} {details}')
         return True
 
-    def _shell_chunk(self, event: ShellOutputEvent) -> None:
+    def _shell_chunk(self, event: CommandOutputEvent) -> None:
         preview = self._shells.setdefault(event.tool_call_id, ShellPreview())
         for char in event.text:
             if preview.completed_lines >= self.shell_lines:
@@ -133,7 +141,7 @@ class ToolOutput:
     def _shell_line(self, preview: ShellPreview) -> None:
         self.console.print(
             shell_text(preview.pending, preview.decoder),
-            style=theme.MUTED,
+            style=theme.color(theme.MUTED),
             markup=False,
             highlight=False,
             overflow='ellipsis',
@@ -142,24 +150,44 @@ class ToolOutput:
         preview.pending = ''
         preview.completed_lines += 1
 
+    def _shell_finished(self, event: CommandFinishedEvent) -> None:
+        preview = self._shells.pop(event.tool_call_id, ShellPreview())
+        if preview.pending and preview.completed_lines < self.shell_lines:
+            self._shell_line(preview)
+        omitted = max(0, event.total_lines - preview.shown) if event.total_lines is not None else 0
+        if omitted:
+            self.console.print(f'Truncated {omitted} lines', style=theme.color(theme.MUTED))
+        state = f'exit {event.exit_code}' if event.exit_code is not None else 'running in background'
+        self.console.print(f'{state} | PID {event.pid}', style=theme.color(theme.MUTED), markup=False, highlight=False)
+        self.console.print(
+            f'Output: {terminal_text(event.output_path)}', style=theme.color(theme.MUTED), markup=False, highlight=False
+        )
+        self.console.print(
+            f'Status: {terminal_text(event.status_path)}', style=theme.color(theme.MUTED), markup=False, highlight=False
+        )
+        if event.truncated and not omitted:
+            self.console.print(
+                'Output preview truncated; full output is in the command log.', style=theme.color(theme.MUTED)
+            )
+        self.console.print()
+
     def _diff(self, diff: str, *, truncated: bool) -> None:
+        if not self.show_output:
+            return
         safe_diff = terminal_text(diff)
         if safe_diff:
             if self.console.is_terminal:
-                self.console.file.write(
-                    DiffRenderer(
-                        theme=DiffTheme(
-                            addition=theme.DIFF_ADDITION,
-                            deletion=theme.DIFF_DELETION,
-                            marker_brighten=2.0,
-                        )
-                    ).render(safe_diff)
+                colors = (
+                    DiffTheme(addition=theme.DIFF_ADDITION, deletion=theme.DIFF_DELETION, marker_brighten=2.0)
+                    if theme.current() is None
+                    else None
                 )
+                self.console.file.write(DiffRenderer(theme=colors).render(safe_diff))
                 self.console.file.flush()
             else:
                 self.console.print(safe_diff, markup=False, highlight=False)
         if truncated:
-            self.console.print('Diff truncated.', style=theme.MUTED)
+            self.console.print('Diff truncated.', style=theme.color(theme.MUTED))
         self.console.print()
 
     def abort(self) -> None:
@@ -174,34 +202,22 @@ class ToolOutput:
 
     def render(self, event: AgentStreamEvent) -> bool:
         """Return whether this event belongs to the specialized tool display."""
-        if isinstance(event, ShellStartedEvent):
+        if isinstance(event, CommandStartedEvent):
             self._shells[event.tool_call_id] = ShellPreview()
             key = (event.tool_call_id, 'shell')
             if key not in self._headers:
                 self._header('shell', event.command)
             self._headers.discard(key)
-        elif isinstance(event, ShellOutputEvent):
-            self._shell_chunk(event)
-        elif isinstance(event, ShellFinishedEvent):
-            preview = self._shells.pop(event.tool_call_id, ShellPreview())
-            if preview.pending and preview.completed_lines < self.shell_lines:
-                self._shell_line(preview)
-            omitted = max(0, event.total_lines - preview.shown) if event.total_lines is not None else 0
-            if omitted:
-                self.console.print(f'Truncated {omitted} lines', style=theme.MUTED)
-            state = f'exit {event.exit_code}' if event.exit_code is not None else 'running in background'
-            self.console.print(f'{state} | PID {event.pid}', style=theme.MUTED, markup=False, highlight=False)
-            self.console.print(
-                f'Output: {terminal_text(event.output_path)}', style=theme.MUTED, markup=False, highlight=False
-            )
-            self.console.print(
-                f'Status: {terminal_text(event.status_path)}', style=theme.MUTED, markup=False, highlight=False
-            )
-            if event.truncated and not omitted:
-                self.console.print('Output preview truncated; full output is in the command log.', style=theme.MUTED)
-            self.console.print()
+        elif isinstance(event, CommandOutputEvent):
+            if self.show_output:
+                self._shell_chunk(event)
+        elif isinstance(event, CommandFinishedEvent):
+            if not self.show_output:
+                self._shells.pop(event.tool_call_id, None)
+                return True
+            self._shell_finished(event)
         elif isinstance(event, FileChangeRequestEvent):
-            if event.operation == 'write':
+            if self.show_output and event.operation == 'write':
                 self._writes[event.tool_call_id, event.root_dir, event.path] = event
         elif isinstance(event, FileEditedEvent):
             key = (event.tool_call_id, 'edit_file')
@@ -214,6 +230,8 @@ class ToolOutput:
             if key not in self._headers:
                 self._header('write_file', event.path)
             self._headers.discard(key)
+            if not self.show_output:
+                return True
             request = self._writes.pop((event.tool_call_id, event.root_dir, event.path), None)
             if request is not None and not request.cancelled:
                 self._diff(request.diff, truncated=request.truncated)

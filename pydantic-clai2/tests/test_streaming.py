@@ -2,13 +2,17 @@
 
 import asyncio
 import io
+from typing import IO
 
 import pytest
-from pydantic_ai import FunctionToolCallEvent, FunctionToolResultEvent, PartStartEvent, TextPart, ThinkingPart
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+from pydantic_ai import FunctionToolCallEvent, FunctionToolResultEvent, PartDeltaEvent, PartStartEvent, TextPart
+from pydantic_ai.messages import ThinkingPart, ThinkingPartDelta, ToolCallPart, ToolReturnPart
 from rich.console import Console
+from rich.text import Text
+from termflow.stream import SmoothWriter  # pyright: ignore[reportMissingTypeStubs]
 
 from pydantic_clai2 import StreamRenderer
+from pydantic_clai2.config import Settings
 
 
 @pytest.fixture
@@ -29,9 +33,10 @@ async def test_intermediate_text_flushes_before_tool_arguments() -> None:
     assert output.getvalue() == before
 
 
-async def test_tools_have_one_line_and_one_blank_separator() -> None:
+@pytest.mark.parametrize('show_tool_output', [False, True])
+async def test_tools_have_one_line_with_blank_separators(show_tool_output: bool) -> None:
     output = io.StringIO()
-    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None)
+    renderer = StreamRenderer(Console(file=output), stop_loading=lambda: None, show_tool_output=show_tool_output)
     for name in ('shell', 'write_file', 'shell'):
         await renderer.on_stream_event(FunctionToolCallEvent(part=ToolCallPart(tool_name=name, args='{}')))
         await renderer.on_stream_event(
@@ -46,6 +51,7 @@ async def test_long_tool_name_does_not_wrap() -> None:
     renderer = StreamRenderer(Console(file=output, width=20), stop_loading=lambda: None)
     await renderer.on_stream_event(FunctionToolCallEvent(part=ToolCallPart(tool_name='a' * 100, args='{}')))
     assert len(output.getvalue().splitlines()) == 2
+    assert output.getvalue().endswith('\n\n')
 
 
 async def test_markdown_uses_brand_palette() -> None:
@@ -70,7 +76,7 @@ async def test_empty_thinking_does_not_print_heading() -> None:
     assert 'Thinking' not in output.getvalue()
 
 
-async def test_thinking_streams_before_newline_or_part_end() -> None:
+async def test_thinking_streams_complete_lines_before_part_end() -> None:
     emitted = asyncio.Event()
 
     class ObservedOutput(io.StringIO):
@@ -81,7 +87,8 @@ async def test_thinking_streams_before_newline_or_part_end() -> None:
 
     output = ObservedOutput()
     renderer = StreamRenderer(Console(file=output, force_terminal=True), stop_loading=lambda: None)
-    await renderer.on_stream_event(PartStartEvent(index=0, part=ThinkingPart(content='zzzzz')))
+    await renderer.on_stream_event(PartStartEvent(index=0, part=ThinkingPart(content='zzzzz\n')))
+    await renderer.on_stream_event(PartDeltaEvent(index=0, delta=ThinkingPartDelta(content_delta='zzz')))
     try:
         await asyncio.wait_for(emitted.wait(), timeout=2)
     finally:
@@ -89,12 +96,18 @@ async def test_thinking_streams_before_newline_or_part_end() -> None:
     assert 'z' in output.getvalue()
 
 
-async def test_redirected_thinking_is_immediate_and_literal() -> None:
+async def test_redirected_thinking_is_dim_markdown() -> None:
     output = io.StringIO()
     renderer = StreamRenderer(Console(file=output, force_terminal=False), stop_loading=lambda: None)
-    await renderer.on_stream_event(PartStartEvent(index=0, part=ThinkingPart(content='[bold]literal')))
-    assert '[bold]literal' in output.getvalue()
+    await renderer.on_stream_event(
+        PartStartEvent(index=0, part=ThinkingPart(content='## Plan first\n[bold]literal[/bold]\n'))
+    )
     await renderer.finish()
+    assert '## Plan' not in output.getvalue()
+    assert '\x1b[2m' in output.getvalue()  # Termflow's dim renderer paints the reasoning
+    plain = Text.from_ansi(output.getvalue()).plain
+    assert plain.startswith('Thinking Plan first')
+    assert '[bold]literal[/bold]' in plain  # Rich markup in reasoning stays literal
 
 
 async def test_burst_is_queued_then_drained() -> None:
@@ -137,3 +150,32 @@ async def test_cancel_during_drain_stops_writer() -> None:
         await task
     await renderer.abort()
     assert output.getvalue().count('x') < 10000
+
+
+async def test_smoothing_defaults_match_code_puppy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin smooth_stream.py defaults from Code Puppy a862bf478b63."""
+    observed: list[tuple[float, float, int]] = []
+
+    def writer(
+        target: IO[str], *, tick_interval: float, catch_up_seconds: float, min_chars_per_tick: int
+    ) -> SmoothWriter:
+        observed.append((tick_interval, catch_up_seconds, min_chars_per_tick))
+        return SmoothWriter(
+            target,
+            tick_interval=tick_interval,
+            catch_up_seconds=catch_up_seconds,
+            min_chars_per_tick=min_chars_per_tick,
+        )
+
+    monkeypatch.setattr('pydantic_clai2._rendering.SmoothWriter', writer)
+    output = io.StringIO()
+    renderer = StreamRenderer(
+        Console(file=output, force_terminal=True), stop_loading=lambda: None, smooth_seconds=Settings().smooth_seconds
+    )
+    await renderer.on_stream_event(PartStartEvent(index=0, part=ThinkingPart(content='thinking text\n')))
+    await renderer.on_stream_event(PartStartEvent(index=1, part=TextPart(content='response text\n')))
+    await renderer.finish()
+    assert observed == [(0.02, 0.4, 2), (0.012, 0.5, 1)]
+    text = Text.from_ansi(output.getvalue()).plain
+    assert 'Thinking thinking text' in text
+    assert 'response text' in text

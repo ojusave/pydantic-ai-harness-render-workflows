@@ -1,7 +1,7 @@
 """Conversation-local settings and actions behind `/set`."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from pydantic import JsonValue, TypeAdapter
@@ -10,6 +10,7 @@ from pydantic_ai.settings import ModelSettings
 from .commands import Command
 from .config import SETTING_FIELDS, Settings
 from .model_settings import model_settings_from_json
+from .project_settings import ProjectSettings
 from .settings_store import SettingsStore
 
 
@@ -30,6 +31,17 @@ class CommandContext:
     store: SettingsStore
     clear_history: Callable[[], None]
     apply_setting: Callable[[str, Settings], None]
+    project: ProjectSettings = field(default_factory=ProjectSettings)
+    """Read-only here: `/set` writes the user store, and the project file wins again at next start."""
+
+    def __post_init__(self) -> None:
+        """Keep the configured model selectable, including preferences saved before the model list existed."""
+        if self.settings.model:
+            self.store.add_model(name=self.settings.model)
+
+    def from_project(self, key: str) -> bool:
+        """Whether the project file sets `key`, so a saved value only lasts for this session."""
+        return key in self.project.overrides
 
     def set_setting(self, args: list[str]) -> str:
         """Validate, persist, and apply a preference to the current conversation."""
@@ -46,14 +58,18 @@ class CommandContext:
     def validate(self, key: str, raw: str) -> tuple[JsonValue, Settings]:
         """Parse typed text for `key` and check it against the whole settings model; nothing is saved."""
         adapter: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
-        value: JsonValue = raw if key == 'model' else adapter.validate_json(raw)
+        value: JsonValue = (
+            raw
+            if key in ('model', 'display.theme') or (key == 'sessions.naming_model' and raw != 'null')
+            else adapter.validate_json(raw)
+        )
         updated = self.settings.model_dump()
         updated[SETTING_FIELDS[key]] = value
         return value, Settings.model_validate(updated)
 
     def model_settings(self, model: str) -> ModelSettings | None:
-        """Saved overrides for `model`, ready for `agent.run`; `None` when there are none."""
-        return model_settings_from_json(self.store.model_settings(model)).to_model_settings()
+        """Family defaults plus saved overrides, ready for `agent.run`."""
+        return model_settings_from_json(self.store.model_settings(model), model=model).to_model_settings()
 
     def reset_setting(self, key: str) -> str:
         """Forget the saved override and apply the default now."""
@@ -68,6 +84,8 @@ class CommandContext:
         self.settings = settings
         self.apply_setting(key, settings)
 
-    @staticmethod
-    def _when(key: str) -> str:
-        return 'Applies at next startup.' if key == 'display.splash' else 'Applied.'
+    def _when(self, key: str) -> str:
+        when = 'Applies at next startup.' if key == 'display.splash' else 'Applied.'
+        if self.from_project(key):
+            when += ' The project file sets it again at next start.'
+        return when

@@ -1,8 +1,9 @@
 """Everything a plugin can register, recorded on one host per plugin."""
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from typing import Generic, Literal, Never, TypeVar, get_args, overload
+from typing import Generic, Literal, Never, Protocol, TypeVar, get_args, overload
 
 from pydantic import BaseModel, JsonValue
 from pydantic_ai import AgentRunResult, AgentStreamEvent
@@ -43,11 +44,15 @@ from pydantic_ai.capabilities.hooks import (
     WrapToolExecuteHookFunc,
     WrapToolValidateHookFunc,
 )
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models import Model
+from pydantic_ai_harness.step_persistence import StepStore
 from rich.console import Console, RenderableType
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from .commands import Commands
 from .config import Settings
+from .status import Status, StatusSegment
 
 DepsT = DefaultTypeVar('DepsT', default=None)
 EventT = TypeVar('EventT', bound=AgentStreamEvent)
@@ -55,6 +60,56 @@ ModelT = TypeVar('ModelT', bound=BaseModel)
 
 SessionEndReason = Literal['exit', 'eof', 'error']
 TurnOutcome = Literal['completed', 'failed', 'cancelled']
+
+
+class Conversation(Protocol):
+    """The retained history as a plugin sees it. The shell's `Session` is one; `Transcript` is the plain one."""
+
+    step_store: StepStore | None
+
+    async def commit_messages(self, messages: Sequence[ModelMessage]) -> None:
+        """Persist and publish a between-turn history replacement."""
+        ...
+
+    @property
+    def messages(self) -> list[ModelMessage]:
+        """A snapshot of the retained messages."""
+        ...
+
+    def replace_messages(self, messages: Sequence[ModelMessage]) -> None:
+        """Swap the retained history, as `/compact` does after summarising it."""
+        ...
+
+    async def resolved_model(self) -> Model | str | None:
+        """The model the next run uses; `None` when nothing has been chosen yet."""
+        ...
+
+
+class Transcript:
+    """An in-memory `Conversation` for hosts built outside the shell, such as in a plugin's tests."""
+
+    def __init__(self, *, messages: Sequence[ModelMessage] = (), model: Model | str | None = None) -> None:
+        """Start with `messages` retained and `model` as what `resolved_model` reports."""
+        self._messages = list(messages)
+        self.step_store: StepStore | None = None
+        self.model = model
+
+    @property
+    def messages(self) -> list[ModelMessage]:
+        """A snapshot of the retained messages, like `Session.messages`; edit through `replace_messages`."""
+        return list(self._messages)
+
+    def replace_messages(self, messages: Sequence[ModelMessage]) -> None:
+        """Swap the retained history."""
+        self._messages = list(messages)
+
+    async def commit_messages(self, messages: Sequence[ModelMessage]) -> None:
+        """Publish an in-memory history replacement."""
+        self.replace_messages(messages)
+
+    async def resolved_model(self) -> Model | str | None:
+        """The `model` given at construction."""
+        return self.model
 
 
 @dataclass(kw_only=True)
@@ -100,6 +155,15 @@ HostEvent = SessionStart | SessionEnd | TurnStart | TurnEnd
 HostEventT = TypeVar('HostEventT', bound=HostEvent)
 HostHandler = Callable[[HostEventT], Awaitable[None]]
 Renderer = Callable[[EventT], RenderableType | None]
+FullScreen = Callable[[], AbstractAsyncContextManager[None]]
+"""Enter it to own the whole terminal for a widget while the agent runs; see `PluginHost.full_screen`."""
+
+
+@asynccontextmanager
+async def bare_screen() -> AsyncGenerator[None]:
+    """The `FullScreen` of a host with no shell around it: nothing is streaming, so nothing to pause."""
+    yield
+
 
 HostHookName = Literal['session_start', 'session_end', 'turn_start', 'turn_end']
 CoreHookName = Literal[
@@ -149,10 +213,32 @@ CORE_HOOK_NAMES: frozenset[str] = frozenset(get_args(CoreHookName))
 class PluginHost(Generic[DepsT]):
     """The one object a plugin talks to. Discarding the host unloads the plugin."""
 
-    def __init__(self, *, name: str, console: Console, settings: dict[str, JsonValue]) -> None:
-        """`settings` is the raw JSON from `plugins add`; validate it with `settings(Model)`."""
+    def __init__(
+        self,
+        *,
+        name: str,
+        console: Console,
+        settings: dict[str, JsonValue],
+        full_screen: FullScreen = bare_screen,
+        conversation: Conversation | None = None,
+        status: Status | None = None,
+    ) -> None:
+        """`settings` is the raw JSON from `plugins add`; validate it with `settings(Model)`.
+
+        The shell passes its own `conversation` and `status`; a host built elsewhere gets a
+        `Transcript` and a detached status row, so a plugin needs no special case for either.
+        """
         self.name = name
         self.console = console
+        self.full_screen = full_screen
+        """Own the whole terminal for a widget mid-run.
+
+        `async with host.full_screen():` flushes streamed output and pauses the status row until
+        the block exits, so a full-screen menu opened from inside a tool call draws on a settled
+        screen. Between turns it is a no-op.
+        """
+        self.conversation: Conversation = conversation if conversation is not None else Transcript()
+        self.status = status if status is not None else Status()
         self.commands = Commands()
         self._settings = settings
         self._hooks: Hooks[DepsT] = Hooks()
@@ -160,6 +246,7 @@ class PluginHost(Generic[DepsT]):
         self._capabilities: list[AgentCapability[DepsT]] = []
         self._handlers: list[Callable[[HostEvent], Awaitable[None]]] = []
         self._renderers: list[Renderer[AgentStreamEvent]] = []
+        self._segments: list[StatusSegment] = []
 
     @property
     def capabilities(self) -> list[AgentCapability[DepsT]]:
@@ -176,11 +263,17 @@ class PluginHost(Generic[DepsT]):
         """Renderers; each returns `None` for events it was not registered for."""
         return list(self._renderers)
 
+    @property
+    def status_segments(self) -> list[StatusSegment]:
+        """Footer fragments; the shell appends them to the built-in status figures."""
+        return list(self._segments)
+
     def summary(self) -> str:
         """One line for the `/plugins` menu."""
         return (
             f'{len(list(self.commands))} commands, {len(self._handlers)} hooks, '
-            f'{len(self._capabilities)} capabilities, {len(self._renderers)} renderers'
+            f'{len(self._capabilities)} capabilities, {len(self._renderers)} renderers, '
+            f'{len(self._segments)} status segments'
         )
 
     def settings(self, model: type[ModelT], /) -> ModelT:
@@ -202,6 +295,17 @@ class PluginHost(Generic[DepsT]):
             return func
 
         return decorator
+
+    def status_segment(self, func: StatusSegment, /) -> StatusSegment:
+        """Add a short fragment to the status row, such as the working directory.
+
+        The shell repaints the row about ten times a second, so keep the fragment cheap
+        and synchronous: it is called for every frame, not once per turn. Fragments are
+        appended in registration order, painted `MUTED`, and truncated from the right on
+        a narrow terminal. Unloading the plugin discards them with the rest of its host.
+        """
+        self._segments.append(func)
+        return func
 
     @overload
     def on(

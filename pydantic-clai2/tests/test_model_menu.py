@@ -1,4 +1,4 @@
-"""The `/model` menu, the catalog behind it, and per-model settings."""
+"""The `/add_model` menu, the catalog behind it, and per-model settings."""
 
 from pathlib import Path
 
@@ -13,9 +13,12 @@ from termflow.tui import MenuItem  # pyright: ignore[reportMissingTypeStubs]
 from termflow.tui.menu import MenuResult  # pyright: ignore[reportMissingTypeStubs]
 
 from pydantic_clai2 import Session
+from pydantic_clai2.command_context import CommandContext
+from pydantic_clai2.config import Settings
 from pydantic_clai2.field_menu import FieldMenu
 from pydantic_clai2.model_catalog import catalog, genai_prices_models, runnable_providers
-from pydantic_clai2.model_menu import ModelMenu, ModelSettingsSource, open_model_menu, run_model_flow
+from pydantic_clai2.model_menu import ModelMenu, ModelSettingsSource, open_add_model_menu, run_model_flow
+from pydantic_clai2.model_picker import build_model_picker, model_command, model_completions
 from pydantic_clai2.model_settings import ModelSettingsForm, model_settings_from_json
 from pydantic_clai2.settings_store import SettingsStore
 
@@ -62,8 +65,9 @@ def test_settings_form_validates_and_converts() -> None:
     assert model_settings_from_json(everything).to_model_settings() == everything
     with pytest.raises(ValidationError):
         ModelSettingsForm(max_tokens=0)
+    assert model_settings_from_json({'nope': 1}).to_model_settings() is None
     with pytest.raises(ValidationError):
-        model_settings_from_json({'nope': 1})
+        ModelSettingsForm.model_validate({'nope': 1})
 
 
 def test_store_round_trips_model_settings(tmp_path: Path) -> None:
@@ -80,13 +84,14 @@ def test_model_settings_source(tmp_path: Path) -> None:
     source = ModelSettingsSource(store, 'openai:gpt-5')
     menu = FieldMenu(source)
     keys = [row.key for row in menu.rows]
-    assert keys[:3] == ['max_tokens', 'temperature', 'top_p']
+    assert keys[:3] == ['max_tokens', 'thinking', 'service_tier']
+    assert not {'temperature', 'top_p', 'seed', 'timeout', 'top_k'} & set(keys)
     thinking = menu.row_for('thinking')
     assert thinking is not None and thinking.choices == ('true', 'false', 'minimal', 'low', 'medium', 'high', 'xhigh')
     tier = menu.row_for('service_tier')
     assert tier is not None and tier.choices == ('auto', 'default', 'flex', 'priority')
     max_tokens = menu.rows[0]
-    assert max_tokens.choices == () and source.title == 'Settings for openai:gpt-5'
+    assert max_tokens.choices == () and source.title == 'Settings - openai:gpt-5'
     assert source.problem(max_tokens, '10') is None
     assert source.problem(max_tokens, '0') == 'Input should be greater than 0'
     assert source.problem(max_tokens, 'ten') is not None
@@ -103,7 +108,7 @@ def test_model_settings_source(tmp_path: Path) -> None:
 def test_provider_catalog_and_back_navigation(tmp_path: Path) -> None:
     context, _ = make_context(tmp_path)
     menu = ModelMenu(context)
-    assert menu.providers() == sorted({model.name.partition(':')[0] for model in menu.models})
+    assert menu.providers() == sorted({model.name.partition(':')[0] for model in menu.models} | {'openrouter', 'vllm'})
     codex = menu.for_provider('openai-codex')
     assert all(model.provider == 'openai-codex' for model in codex.models)
     assert {f'openai-codex:gpt-5.6-{suffix}' for suffix in ('luna', 'terra', 'sol')} <= {
@@ -168,10 +173,10 @@ def test_model_menu_rows_details_and_flow(tmp_path: Path) -> None:
     assert run_model_flow(menu, Script(lists=[pick(0)], choices=[], texts=[]).runners) == []
 
 
-async def test_open_model_menu_and_settings_reach_the_run(tmp_path: Path) -> None:
+async def test_open_add_model_menu_and_settings_reach_the_run(tmp_path: Path) -> None:
     context, _ = make_context(tmp_path)
-    assert await open_model_menu(context, run=lambda menu: []) == 'No changes.'
-    assert await open_model_menu(context, run=lambda menu: [menu.choose('test')]) == 'Saved model. Applied.'
+    assert await open_add_model_menu(context, run=lambda menu: []) == 'No changes.'
+    assert await open_add_model_menu(context, run=lambda menu: [menu.choose('test')]) == 'Saved model. Applied.'
     context.store.save_model_settings('test', {'max_tokens': 3, 'seed': 7})
     assert context.model_settings('test') == {'max_tokens': 3, 'seed': 7}
     assert context.model_settings('other') is None
@@ -187,3 +192,61 @@ async def test_open_model_menu_and_settings_reach_the_run(tmp_path: Path) -> Non
     session.model_settings = context.model_settings('test')
     assert (await session.prompt('hi')).output == 'ok'
     assert seen == [{'max_tokens': 3, 'seed': 7}]
+
+
+def test_added_models_persist_independently_of_settings(tmp_path: Path) -> None:
+    context, _ = make_context(tmp_path)
+    original = context.settings.model
+    assert original is not None
+    assert context.store.models() == [original]
+    ModelMenu(context).choose('test')
+    context.store.add_model(name='test')
+    context.store.save_model_settings('test', {'seed': 1})
+    context.store.save_model_settings('test', {})
+    assert SettingsStore(context.store.path).models() == sorted([original, 'test'])
+    assert context.store.load().model == 'test'
+
+
+async def test_saved_model_picker_and_completion(tmp_path: Path) -> None:
+
+    context, applied = make_context(tmp_path)
+    original = context.settings.model
+    assert original is not None
+    context.store.add_model(name='test')
+    assert model_completions(context, ['']) == sorted([original, 'test'])
+    assert model_completions(context, ['test', 'extra']) == []
+    widget = build_model_picker(context)
+    assert widget.highlighted == MenuItem(f'{original} (current)', value=original)
+    script = Script(lists=[pick('test')], choices=[], texts=[])
+    assert await model_command(context, [], runners=script.runners) == 'Saved model. Applied.'
+    assert context.settings.model == 'test' and applied == ['model']
+    assert await model_command(context, [original]) == 'Saved model. Applied.'
+    with pytest.raises(ValueError, match='Model not added: unknown. Use /add_model'):
+        await model_command(context, ['unknown'])
+    with pytest.raises(ValueError, match='Usage: /model'):
+        await model_command(context, ['test', 'extra'])
+    assert 'unknown' not in context.store.models()
+
+
+@pytest.mark.parametrize('result', [MenuResult(cancelled=True), MenuResult(), pick(0)])
+async def test_saved_model_picker_cancel(tmp_path: Path, result: MenuResult) -> None:
+
+    context, applied = make_context(tmp_path)
+    script = Script(lists=[result], choices=[], texts=[])
+    assert await model_command(context, [], runners=script.runners) == 'No changes.'
+    assert applied == []
+
+
+def test_empty_model_picker(tmp_path: Path) -> None:
+
+    context = CommandContext(
+        settings=Settings(model=None),
+        store=SettingsStore(tmp_path / 'empty.db'),
+        clear_history=lambda: None,
+        apply_setting=lambda key, settings: None,
+    )
+    assert model_completions(context, []) == []
+    widget = build_model_picker(context)
+    assert widget.highlighted is not None
+    assert widget.highlighted.disabled
+    assert '/add_model' in widget.highlighted.label

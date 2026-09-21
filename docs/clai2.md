@@ -8,6 +8,13 @@ not protect secret files or repository metadata. OS permissions still apply.
 Relative paths use the launch workspace. Use a custom agent with `Coder()` to
 retain workspace-scoped file tools. Shell output is displayed dimly.
 
+## Word deletion
+
+Option+Backspace (Alt+Backspace) deletes the word before the cursor, like Ctrl-W,
+including trailing whitespace. Spaces, tabs, and newlines separate words. Text
+after the cursor is preserved. Your terminal must send Option as Alt/Meta for
+this shortcut; legacy and modified-key encodings are supported.
+
 ## Interrupting a turn
 
 Press Ctrl-C once to cancel the active agent turn and return to input. Tool cleanup
@@ -54,6 +61,52 @@ pyramid, with CLAI lettering. The persistent `CLAI 2.0` banner uses `ansi_shadow
 The splash is disabled for redirected output, CLI arguments, small terminals,
 Windows, `NO_COLOR`, or `CLAI_NO_SPLASH=1`.
 
+## Git worktrees
+
+```bash
+py-cli clai2 --worktree my-task
+```
+
+```bash
+py-cli clai2 -w
+```
+
+A Git worktree is another checkout of the same repository with its own branch
+and working files. Run these commands inside a repository with at least one
+commit. `--worktree NAME` creates a `clai/NAME` branch from the current `HEAD`
+and starts CLAI at `<repository-root>/.worktrees/NAME`.
+`-w` is the short form; omit the name to generate one. Names start with a letter
+or digit and contain only ASCII letters, digits, hyphens, and underscores.
+
+After checkout succeeds, CLAI adds `/.worktrees/` to Git's local `info/exclude`
+file to keep generated checkouts out of `git status`, without changing your
+tracked `.gitignore`.
+Uncommitted changes, ignored files, and untracked files are not copied. Project settings, repository instructions, and coding
+tools use the new worktree root. Your user settings and plugins stay available;
+a relative `--database` path still refers to the directory you launched from.
+
+CLAI prints the new path and branch. Existing branches and non-empty directories
+are rejected. If checkout fails, CLAI tries to remove only the branch it just
+created, without forcing deletion. If cleanup or the ignore edit fails, the error
+names the retained branch or checkout for recovery. The worktree and branch
+remain after exit, including startup
+errors after creation, so CLAI does not delete your work. Enter that directory
+and run `clai2 --resume` to continue a saved session. `--worktree` cannot be
+combined with `--resume`, `config`, or `plugins`.
+
+When you no longer need the checkout, use Git's own cleanup commands from your
+original repository root. Without `--force`, Git refuses to remove a dirty worktree:
+
+```bash
+git worktree remove .worktrees/my-task
+git branch -d clai/my-task
+```
+
+!!! warning "Worktrees are not sandboxes"
+    A worktree separates working files, not permissions. CLAI's default tools can
+    still access files outside it. Creation runs before the agent starts and emits
+    no agent telemetry spans.
+
 ## Codex authentication
 
 `/login openai-codex` opens the browser and uses core's `OpenAICodexOAuthFlow`:
@@ -82,7 +135,8 @@ an awaitable string.
 
 Preferences live in `$XDG_CONFIG_HOME/pydantic-clai2/config.db`, falling back to
 `~/.config/pydantic-clai2/config.db`. Use `--database PATH` to select another database.
-There is no automatic repository config loading. Conversation messages and CLAI's
+A repository can add its own layer with a `.clai/settings.json` file, found by
+walking up from the launch directory to the git root. Conversation messages and CLAI's
 Codex tokens are not written to the settings database. Plugin settings are arbitrary
 JSON stored in plaintext in this database, including secrets if you put them there.
 Pass secret references or use plugin-owned credential storage instead of embedding keys.
@@ -138,12 +192,36 @@ Settings are validated before writes. `/set` updates the active settings snapsho
 legacy `/config` writes apply on restart; plugin changes apply on the next prompt.
 `--request-limit` controls the full prompt's model-request budget.
 
-Interactive commands: `/login`, `/set`, `/model`, `/help`, `/new`, `/exit`, `/config`, and `/plugins`.
+Interactive commands: `/login`, `/set`, `/theme`, `/model`, `/help`, `/new`, `/exit`, `/config`, `/plugins`, and `/reload`.
 Tab completion suggests commands, settings, boolean values, plugin identifiers,
 and paths after `@`. Path completion inserts a path; it does not attach file contents.
 Unknown slash commands are not sent to the model. Up/down recall prompt history
 within this process. Ctrl-D exits. Ctrl-C at input clears the line; during a run it
 exits and unwinds the agent. No cancelled run is automatically retried.
+
+## Reload CLAI during development
+
+```text
+/reload
+```
+
+After editing `pydantic_clai2` source, run `/reload` without arguments. It uses
+`importlib.reload` on loaded CLAI modules and rebuilds the prompt loop, commands,
+and session with the updated code. The Python process, agent, dependencies passed
+to `chat`, conversation messages, selected model, and active settings are kept.
+Enabled plugins unload and activate again so their handlers use the refreshed
+shell types. Disabled and unapproved project plugins stay off.
+
+If an import or shell rebuild fails, CLAI reports the error and restores the
+previous module bindings. Correct the source and retry `/reload`. Plugin hosts
+and their registrations are recreated. Installed module globals not overwritten
+by the new source can survive; initialize mutable state in `activate`.
+Import-time side effects cannot be undone.
+
+Reload ordering follows the modules' existing imports. Restart after changing
+import dependencies, startup code, or the custom agent's construction. `/reload`
+does not rerun the CLI or recursively reload third-party packages. Use
+`/plugins reload NAME` when you only want to reload one plugin.
 
 ## Bring an agent
 
@@ -163,20 +241,56 @@ failed or cancelled turns leave the previous history intact, though external too
 side effects may already have occurred. History is in memory only. Structured
 outputs are supported and displayed after completion.
 
-CLAI is painted in the Pydantic brand palette: Lithium magenta for headings,
-the banner, and the thing to look at; Calcium for list markers and errors; Aqua
-for links and added diff lines; Pydantic AI cyan for guidance; purple with a
-magenta-to-white shimmer for the active status line and plain purple while idle;
-brand grey for tool previews and hints. On terminals without 24-bit
-colour the nearest of the 16 standard colours is used. Every colour lives in
-`theme.py`. This is local to CLAI; it does not change your terminal's colours
-or Termflow defaults elsewhere. Code block syntax highlighting retains Termflow's
-Monokai default.
+### Themes
+
+```text
+/theme
+/theme tokyo_night
+/set display.theme github_light
+/theme default
+```
+
+`/theme` opens a searchable picker. Its preview shows a sample conversation with
+Markdown, thinking, a tool call, syntax highlighting, warnings, errors, and the
+input/status area. Each bundled palette paints the sample's foreground and
+background. Browsing does not apply a palette or save a setting. Enter confirms;
+Esc or Ctrl-C keeps your current choice. Narrow terminals show the list alone.
+
+`default` preserves CLAI's existing brand colours, including Markdown, menus,
+status, and diff highlighting. Starting and exiting with this choice leaves your
+terminal palette untouched. The default preview has no forced background.
+`/theme default` restores this appearance after trying another palette.
+
+All other choices come from Termflow's bundled registry, including
+`catppuccin_mocha`, `catppuccin_latte`, `tokyo_night`, and `github_light`. CLAI adds
+no new palettes. `/theme NAME` and `/set display.theme NAME` apply the same
+validated preference immediately and save it for future sessions. Tab completes
+these names. The `/set` theme row also lets you reset immediately;
+`/config reset display.theme` removes the saved override for the next startup.
+
+For a bundled palette, Markdown and newly opened menus use Termflow's
+`to_render_style()`, and shell roles use its colours. Termflow changes the terminal
+foreground, background, and 16 ANSI slots via OSC escape sequences. Supported
+terminals may also recolour existing ANSI-styled scrollback. CLAI resets terminal
+colours when you return to `default` or exit a selected palette, including failure
+and cancellation. Unsupported terminals may ignore these changes. Redirected
+output receives no palette-changing sequences. Your terminal configuration file
+is not modified.
+
+The early splash retains its brand colours. Syntax highlighting keeps Monokai;
+bundled palettes use Termflow's default diff colours. Theme selection adds no
+model requests or telemetry.
+
+### Streaming
 
 Streaming matches Code Puppy's separate output and thinking paths:
 
 - Markdown uses Termflow `SmoothWriter`: 12 ms ticks, 0.5-second catch-up,
-  minimum one visible character per tick. Markdown is parsed line-by-line.
+  minimum one visible character per tick. Prose is parsed line-by-line. Fenced
+  code is buffered until the closing fence or text part end, then highlighted
+  as a whole block so multiline strings and comments keep their context.
+  Unlabelled and Markdown fences stay literal, including indentation and blank
+  lines. Unknown languages use plain text. Long code lines wrap to the terminal width.
 - Thinking deltas feed `StreamSmoother` immediately: 20 ms ticks, 0.4-second
   catch-up, minimum two characters per tick. They display as dim literal text,
   without waiting for newlines or interpreting Markdown.
@@ -242,9 +356,9 @@ repeated completion heading before the diff or output.
 
 Native capability events drive specialized output: `FileEditedEvent` renders its
 bounded unified diff using Termflow `DiffRenderer`, the same renderer Code Puppy
-uses. Addition backgrounds are muted teal (`#203c3b`), deletion backgrounds are
-muted burgundy (`#432d3b`), and brighter markers distinguish the changes. Code
-syntax colors are unchanged. Successful file writes also show the proposed diff from their matching
+uses. The default appearance keeps CLAI's existing addition and deletion
+backgrounds; bundled palettes use Termflow's defaults. Both use brighter markers.
+Code syntax colours retain the Monokai default. Successful file writes also show the proposed diff from their matching
 `FileChangeRequestEvent`: new files show additions, overwrites show before/after
 changes. Without a matching request event, only the written path is shown. Failed
 or cancelled writes do not display a success diff. Large diffs retain the
@@ -271,7 +385,7 @@ unavailable. During a request it may reflect the previous response.
 
 While running, the footer reserves the terminal's bottom row using ANSI scrolling
 regions. Its text shimmers with a moving highlight at ten frames per second, with no spinner and a
-16-colour fallback when truecolour is unavailable. Prompt-toolkit owns the footer while accepting input. The run footer is
+a 16-colour fallback when truecolour is unavailable. Prompt-toolkit owns the footer while accepting input. The run footer is
 disabled for redirected output and restores normal scrolling on cancellation or
 failure. The cursor is hidden during runs and restored on completion, failure,
 or cancellation. No model requests or telemetry are added for status reporting.
@@ -312,3 +426,13 @@ requests, tools, and capability hooks when configured on the supplied agent.
 - [Code Puppy command registry](https://github.com/code-puppy/code_puppy/blob/main/code_puppy/command_line/command_registry.py)
 
 See `THIRD_PARTY_NOTICES.md` for attribution.
+
+## vllm connection
+
+Open `/model`, choose `vllm`, then enter a trusted HTTP(S) server root or `/v1` URL, and optionally a token. CLAI queries `/v1/models` and opens a searchable model picker. HTTP sends tokens unencrypted; use HTTPS outside trusted local networks.
+
+## openrouter connection
+
+Open `/model`, choose `openrouter`, then paste an API key from https://openrouter.ai/keys in the masked prompt, then select a model from the live catalog. CLAI validates the key with `/api/v1/key` before fetching `/api/v1/models`. This flow uses API-key authentication, not browser OAuth.
+
+The connection is saved in the configured Python keyring backend after selection; backend security depends on your keyring configuration. Tokens are not stored in SQLite or command history. The selected model persists across restarts. Select the provider again to browse its live models or reconfigure the saved connection. Discovery is explicit and has a 20-second network timeout; redirects are not followed. Agent inference uses Pydantic AI core.

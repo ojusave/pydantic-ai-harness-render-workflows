@@ -84,3 +84,40 @@ def test_double_press_window() -> None:
     assert not interrupts.press()
     now = 4.0
     assert interrupts.press()
+
+
+async def test_direct_cancellation_in_worker_thread() -> None:
+    async def scenario() -> None:
+        interrupts = Interrupts()
+        cleaned = asyncio.Event()
+
+        async def operation() -> None:
+            try:
+                assert interrupts.cancel()
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+
+        assert not await interrupts.run(operation())
+        assert cleaned.is_set()
+        assert not interrupts.cancel()
+
+    original = signal.getsignal(signal.SIGINT)
+    await asyncio.to_thread(asyncio.run, scenario())
+    assert signal.getsignal(signal.SIGINT) == original
+
+
+async def test_escape_cancellation_does_not_arm_exit() -> None:
+    interrupts = Interrupts(clock=lambda: 0.0)
+    assert not interrupts.active
+
+    async def operation() -> None:
+        assert interrupts.active
+        assert interrupts.cancel(exit_on_repeat=False)
+        assert interrupts.cancel(exit_on_repeat=False)
+        await asyncio.Event().wait()
+
+    assert not await interrupts.run(operation())
+    assert not interrupts.active
+    assert not interrupts.exit_requested
+    assert not interrupts.press()

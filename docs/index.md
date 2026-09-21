@@ -60,11 +60,11 @@ agent = Agent(
 )
 ```
 
-[Skills](skills.md) (your `SKILL.md` procedures, loaded on demand; point it at a `skills/` directory and add the `skills` extra), [Web Fetch](/ai/capabilities/web-fetch/), [Guardrails](guardrails.md), and [Dynamic Workflow](dynamic-workflow.md) slot in the same way; the [Coder page](coder.md#not-included-by-default) lists what pairs well.
+[Skills](skills.md) (your `SKILL.md` procedures, loaded on demand; point it at a `skills/` directory and add the `skills` extra), [Web Fetch](/ai/capabilities/web-fetch/), [Guardrails](guardrails.md), and [Dynamic Workflow](dynamic-workflow.md) slot in the same way; the [Coder page](coder.md#composition) lists what pairs well.
 
 ## No magic: it's capabilities all the way down
 
-`Coder` is a regular combined capability with six coding tools, autonomous engineering guidance, repository context, and context limits. Its private tools and JSON repair ship together; standalone capabilities remain independently available.
+`Coder` is a regular combined capability: [`FileSystem`](filesystem.md) with five of its tools and content hashes off, [`Shell`](shell.md) with its persistent `shell` tool and no allowlist, [`RepoContext`](repo-context.md), [`ClearToolResults` and `WarnNearLimits`](compaction.md), and a bounded [`ToolOutputLimits`](tool-output-limits.md), plus its default instructions and JSON argument repair. Use it whole, or build the same agent from those capabilities to change any setting; the [Coder page](coder.md) lists the exact configuration.
 
 <!-- Keep this blown-out example in sync across docs/coder.md, docs/index.md, README.md, pydantic_ai_harness/coder/README.md, and examples/coding_agent.py. -->
 
@@ -100,8 +100,8 @@ The workspace the agent acts in: the files it edits and the commands it runs, lo
 
 | Capability | Package | What it does |
 |---|---|---|
-| [FileSystem](filesystem.md) | Harness | Read, write, edit, search files under a root; path-traversal and symlink safe, secrets read-only |
-| [Shell](shell.md) | Harness | Command execution with allowlists, denylists, timeouts, and credential-stripping |
+| [FileSystem](filesystem.md) | Harness | Read, write, edit, list, and search files under a root, with opt-in ripgrep tools; path-traversal and symlink safe, secrets read-only |
+| [Shell](shell.md) | Harness | Command execution with allowlists, denylists, timeouts, credential-stripping, and opt-in commands that outlive the run |
 | [Modal Sandbox](modal-sandbox.md) | Harness | Commands and files in an isolated [Modal](https://modal.com) cloud sandbox |
 
 ### Tools & native abilities
@@ -143,6 +143,7 @@ How the agent thinks and divides the work.
 | [Subagents](subagents.md) | Harness | Delegate self-contained tasks to named child agents |
 | [Dynamic Workflow](dynamic-workflow.md) | Harness | The model orchestrates sub-agents from one Python script: fan-out, chain, vote in a single tool call, with hard `max_agent_calls` budgets |
 | [Advisor](advisor.md) | Harness | Let an executor consult a stronger model mid-run |
+| [Background Tools](background-tools.md) | Harness | Run selected tools concurrently; results arrive as follow-up messages |
 
 ### Context management
 
@@ -175,9 +176,11 @@ Bounding what the agent may do, and keeping it on-instructions.
 
 | Capability | Package | What it does |
 |---|---|---|
+| [Repair Tool Arguments](repair-tool-arguments.md) | Harness | Repair malformed JSON tool arguments before schema validation. |
 | [Guardrails](guardrails.md) | Harness | Validate/block/redact user input, tool calls, tool results, and output, including secret masking and parallel async guards |
 | [Prompt Injection Defender](prompt-injection-defender.md) | Harness | Classify local tool results for indirect prompt injection and optionally withhold high-risk results |
 | [Spend Limits](spend.md) | Harness | Cross-window USD/token budgets and per-response cost tracking, per model and per tenant |
+| [Ask User](ask-user.md) | Harness | Let the model ask the user multiple-choice questions mid-run; you supply the answerer (terminal, web, test) |
 | [Tool approval](/ai/tools-toolsets/deferred-tools/#human-in-the-loop-tool-approval) | Core | Flag tool calls that need human approval before they run |
 | [Handle Deferred Tool Calls](/ai/capabilities/handle-deferred-tool-calls/) | Core | Resolve approval-deferred tool calls programmatically |
 | [System Reminders](system-reminders.md) | Harness | Cache-safe re-injection of guidance mid-run to counter instruction fade |

@@ -20,6 +20,9 @@ dependencies = [
     'prompt-toolkit>=3.0.52',
     'rich>=14',
     "keyring>=25.6",
+    "pillow>=12.3.0",
+    # Default telemetry plugin: https://github.com/pydantic/pydantic-ai-harness/issues/979.
+    "logfire>=4.31.0",
 ]
 
 [project.scripts]
@@ -29,16 +32,7 @@ clai2 = 'pydantic_clai2.__main__:main'
 packages = ['src/pydantic_clai2']
 
 [tool.uv.sources]
-pydantic-ai-harness = { path = '..', editable = true }
-
-[dependency-groups]
-dev = ['pytest>=9', 'pytest-anyio', 'pyright>=1.1.408', 'ruff>=0.14', 'coverage>=7.10.7']
-
-[tool.pyright]
-pythonVersion = '3.11'
-typeCheckingMode = 'strict'
-venvPath = '.'
-venv = '.venv'
+pydantic-ai-harness = { workspace = true }
 
 [tool.ruff]
 extend = '../pyproject.toml'

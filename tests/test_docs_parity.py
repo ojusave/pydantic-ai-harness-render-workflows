@@ -123,8 +123,9 @@ _CAPABILITY_DOC_PAGES = _capability_doc_pages()
 # or empty heading, fails instead of passing on a substring match.
 _CAPABILITY_PAGE_META = {
     'advisor.md': ('advisor', 'Advisor'),
+    'ask-user.md': ('ask_user', 'Ask User'),
     'aws-lambda.md': ('aws_lambda', 'AWS Lambda Durability'),
-    'render-workflows.md': ('render', 'Render Workflows'),
+    'background-tools.md': ('background_tools', 'Background Tools'),
     'code-mode.md': ('code_mode', 'Code Mode'),
     'coder.md': ('coder', 'Coder'),
     'skills.md': ('skills', 'Skills'),
@@ -134,6 +135,8 @@ _CAPABILITY_PAGE_META = {
     'memory.md': ('memory', 'Memory'),
     'modal-sandbox.md': ('modal_sandbox', 'Modal Sandbox'),
     'repo-context.md': ('repo_context', 'Repo Context'),
+    'repair-tool-arguments.md': ('repair_tool_arguments', 'Repair Tool Arguments'),
+    'render-workflows.md': ('render', 'Render Workflows'),
     'researcher.md': ('researcher', 'Researcher'),
     'pydantic-ai-docs.md': ('pydantic_ai_docs', 'Pydantic AI Docs'),
     'exa-search.md': ('exa', 'Exa Search'),
