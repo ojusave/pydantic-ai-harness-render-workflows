@@ -69,6 +69,8 @@ DEFAULT_PLUGINS: tuple[PluginSettings, ...] = (
     PluginSettings(id='compaction', factory='pydantic_clai2.compaction', settings={}),
     PluginSettings(id='persistence', factory='pydantic_clai2.sessions'),
     PluginSettings(id='logfire', factory='pydantic_clai2.logfire'),
+    PluginSettings(id='notifications', factory='pydantic_clai2.notifications'),
+    PluginSettings(id='mcp', factory='pydantic_clai2.mcp'),
     *HARNESS_PLUGINS,
 )
 """Built-in declarations, including opt-in harness capabilities. `remove` restores their defaults.
@@ -454,7 +456,7 @@ class _Shell(Generic[DepsT, OutputT]):
             return True
         if not self.session.steer(resolved, images=images):
             return False
-        self.images.notice = f'Steering sent: {text} | Alt+Enter: queue'
+        self.images.notice = f'Steering sent: {text}'
         return True
 
     async def _read_loop(self) -> SessionEndReason:

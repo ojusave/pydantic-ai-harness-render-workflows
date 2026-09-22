@@ -12,6 +12,16 @@ Context management is the built-in `compaction` plugin,
 The `/plugins` menu also lists every other harness capability, disabled by
 default. Press Space to enable one. Some need optional packages, credentials,
 or constructor settings first; see [optional harness capabilities](PLUGINS.md#optional-harness-capabilities).
+The built-in `mcp` plugin includes the MCP client and `/mcp` command. Configure
+trusted stdio or Streamable HTTP servers through plugin settings; no server is
+connected by default. `/mcp` lists configuration, and `/mcp tools NAME` connects
+briefly to discover tools. HTTP redirects are rejected; use the final endpoint URL.
+During runs, core manages connections and prefixes
+tool names with the configured server name. Local server programs still need to
+be installed separately. Settings are plain JSON, so avoid storing secrets there.
+See [Connect MCP servers](PLUGINS.md#connect-mcp-servers) for configuration and
+trust guidance. `/plugins disable mcp` removes its command and tools.
+
 Python 3.11+ is required by Termflow. Tracking issue: https://github.com/pydantic/pydantic-ai-harness/issues/875.
 
 CLAI file tools can access paths outside the workspace, including `/tmp`, and do
@@ -27,6 +37,28 @@ Use `/set display.tool_output true` to show detailed output again, or
 `/set display.tool_output false` to return to summaries. In detailed mode,
 `display.shell_lines` and `display.grep_lines` limit previews to 20 lines by
 default. Plugin-provided rendering, including interactive questions, is unchanged.
+
+## Desktop notifications
+
+The built-in `notifications` plugin is enabled by default. Interactive sessions
+send a desktop notification when a turn finishes or fails, and when the model
+asks a question through `ask_user`. Cancelled turns do not notify. Messages use
+the title `CLAI2` and generic status text, not prompts, answers, paths, or errors.
+
+macOS uses the system `osascript` notification service. Allow notifications for
+Script Editor in System Settings > Notifications; Focus modes can suppress them.
+Linux uses `/usr/bin/notify-send` when installed and a desktop notification service is
+available. Windows, redirected output, headless mode, and SSH sessions do not
+send notifications. These are local OS notifications, not terminal escape
+sequences, so local tmux sessions need no passthrough configuration. CLAI does
+not detect terminal focus; notifications are submitted even while you are
+looking at the terminal. Delivery and presentation depend on OS settings.
+
+Use `/plugins disable notifications` to persistently turn them off and
+`/plugins enable notifications` to restore them. `/plugins remove notifications`
+resets the built-in default. Missing services, nonzero exits, and a two-second
+submission timeout do not fail the turn. No notification-specific telemetry is
+emitted.
 
 ## Code highlighting
 
@@ -79,7 +111,11 @@ model | context: ... | running: shell
 ```
 
 The prompt sits above the footer with one editable line when empty. It grows
-for wrapped or pasted text, not to fill the terminal. Completion suggestions
+for wrapped or pasted text, not to fill the terminal. Text pastes of five or more
+lines, or at least 1,000 characters, display as `[paste N lines]`. The full text
+is still submitted and saved in input history. Move the cursor inside a folded
+paste to reveal it for editing; recalled history shows the full text.
+Completion suggestions
 appear below the draft, between the top and bottom rules. The rows carry no
 side borders and no prompt marker, so they cannot drift out of alignment.
 History search stays compact too. The bordered prompt area stays visible below
@@ -228,10 +264,17 @@ a relative `--database` path still refers to the directory you launched from.
 CLAI prints the new path and branch. Existing branches and non-empty directories
 are rejected. If checkout fails, CLAI tries to remove only the branch it just
 created, without forcing deletion. If cleanup or the ignore edit fails, the error
-names the retained branch or checkout for recovery. The worktree and branch
-remain after exit, including startup
-errors after creation, so CLAI does not delete your work. Enter that directory
-and run `clai2 --resume` to continue a saved session. `--worktree` cannot be
+names the retained branch or checkout for recovery.
+
+On normal interactive exit from a linked worktree, CLAI asks whether to remove
+its checkout. Enter, Ctrl-C, or EOF keeps it; only `y` or `yes` confirms removal.
+This also applies when launching inside an existing linked worktree. Git removal
+runs without `--force`, so dirty or locked worktrees are kept with an explanation.
+The branch is kept even when removal succeeds. The main checkout is not offered
+for removal. Headless runs, piped input, and startup errors keep the worktree
+without prompting. `/new`, `/resume`, and `/reload` do not remove the checkout:
+they leave the shell using the same working directory.
+Enter a retained directory and run `clai2 --resume` to continue a saved session. `--worktree` cannot be
 combined with `--resume`, `config`, or `plugins`.
 
 When you no longer need the checkout, use Git's own cleanup commands from your
@@ -325,9 +368,11 @@ not change output-validation or HTTP transport retries.
 
 ## Models and their settings
 
-`/model` selects from models you have already added. Its flat, searchable picker
-and Tab completion use only that saved list. `/model NAME` switches directly to
-an added model. The currently configured model is kept in the list when upgrading.
+`/model` selects from models you have already added. Choose **Add a model...**
+to browse providers and select a new model without leaving the command. This
+option is available even when no models have been added. Tab completion uses
+only the saved list. `/model NAME` switches directly to an added model.
+The currently configured model is kept in the list when upgrading.
 
 `/add_model` opens a searchable provider list, then a model picker for that provider.
 Esc from the model list returns to providers. Providers are unique prefixes from
@@ -354,6 +399,16 @@ Tab completes added models.
 `Ctrl+S` in `/add_model` opens the same editor. Edits save immediately and apply
 on the next prompt. `r` resets a field; Esc or Ctrl-C goes back. Fixed choices
 open a picker; numeric fields accept typed values, and empty input resets.
+
+First add `openai-codex:gpt-6-astra` with `/add_model`, then open `/model_settings openai-codex:gpt-6-astra`
+(or your saved Codex model), then **Service Tier / Fast Mode**. Choose
+**Fast (priority)** to request fast processing, or **Standard (default)** to
+turn it off. [Codex fast mode](https://developers.openai.com/codex/speed)
+uses more ChatGPT credits and depends on model and account availability. It does
+not lower reasoning effort. Reset restores the existing model default; it does
+not enable fast mode. The stored values remain `service_tier=priority` and
+`service_tier=default`, so older CLAI versions can read them. A custom
+`service_tier` body parameter still takes precedence.
 
 Model preferences are shared across checkouts. Reading saved preferences ignores
 unknown fields, so newer settings do not break an older reader with this
@@ -535,10 +590,14 @@ paste of existing image paths creates attachments as described in
 [Pasting images](#pasting-images).
 
 Up/down move through multiline drafts, then recall saved prompt history.
-Enter submits a prompt when idle and steers the current run when busy. Steering
-reaches the model at its next opportunity without cancelling in-flight tools.
-Alt+Enter (Option+Enter) queues a separate follow-up turn; slash commands always
-wait until the current turn ends. While running, the input box shows both submit shortcuts.
+Enter submits a prompt when idle and queues a separate follow-up turn when busy.
+To steer instead, first queue the message with Enter, then press Alt+Enter
+(Option+Enter). This sends the oldest queued follow-up to the active run at its
+next opportunity without cancelling in-flight tools or changing your draft.
+Each Alt+Enter sends one message. If the run is no longer accepting steering,
+the message stays queued. Slash commands and exit signals are not steered or
+skipped over. With no queued message, Alt+Enter does nothing.
+While running, the input box shows both shortcuts.
 Shift-Enter inserts a newline. CLAI requests modified
 key reporting while the editor is active and releases it for menus and on exit.
 Ctrl-R searches history; Enter accepts a search

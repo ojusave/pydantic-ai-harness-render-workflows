@@ -8,6 +8,49 @@ Everything a plugin can do goes through one object, the `PluginHost`. There is n
 global registry to import and no magic file to name. You get a `host`, you tell it
 what you want, you're done.
 
+## Connect MCP servers
+
+The enabled built-in `mcp` plugin provides `/mcp`. CLAI includes the MCP client;
+there is no extra client package to install. Local server programs and their
+runtimes still need to be installed separately. No servers are configured by
+default, and loading the plugin does not start programs or contact endpoints.
+
+Only configure servers you trust. Stdio servers run programs with your user
+permissions. HTTP servers receive tool arguments and can return untrusted content.
+Plugin settings are stored as plain JSON, not in the credential store. Prefer
+inherited environment variables for local credentials; do not paste secrets into
+slash commands, project files, or saved `headers`/`env` settings.
+
+Configure a local server using an executable and an argument list, not a shell command:
+
+```text
+/plugins add mcp pydantic_clai2.mcp '{"servers":{"local":{"transport":"stdio","command":"python","args":["/absolute/path/to/server.py"]}}}'
+/mcp
+/mcp tools local
+```
+
+For Streamable HTTP, use `{"servers":{"remote":{"transport":"http","url":"https://example.com/mcp"}}}`
+as the JSON argument instead. Replace the example endpoint with your server.
+Stdio settings also accept `cwd` and `env`; HTTP settings accept `headers`.
+HTTP redirects are rejected; configure the final MCP endpoint URL.
+Each server accepts `enabled: false` to keep its configuration without using it.
+Names start with a letter and contain only letters and digits. Underscores are
+reserved for the separator so server/tool name pairs cannot produce the same name.
+The model sees tools prefixed by server name, for example `local_search`.
+
+`/mcp` and `/mcp list` show names, transports, and enabled state, not connection
+health or credentials. `/mcp tools NAME` connects to one enabled server, lists
+its prefixed tool names, then closes that connection. Connection errors are
+reported by the shell. During agent runs, core's `MCPToolset` owns connection
+startup, tool execution, and cleanup. The plugin adds no telemetry beyond core's
+tool spans. It does not enable MCP sampling or native provider-side MCP.
+
+`/plugins disable mcp` removes both the tools and command; `/plugins enable mcp`
+restores them. To replace saved configuration, `/plugins remove mcp` first, then
+run `/plugins add` again. Removing the saved override restores the empty built-in.
+Repository declarations in `.clai/settings.json` stay disabled until explicitly
+approved through `/plugins enable mcp`, like other project plugins.
+
 ## On-demand authoring help
 
 The default CLAI agent exposes `read_clai_customization_guide`. When you ask for
@@ -54,6 +97,29 @@ backend exists, credentials go to a per-account `0600` file under the user's CLA
 directory instead. None of this changes plugin APIs. See
 [Codex authentication](README.md#codex-authentication) for storage and security
 details.
+
+## Desktop notifications
+
+The default-enabled `notifications` plugin (`pydantic_clai2.notifications`)
+observes `turn_end` for completed and failed turns and `AskUserRequestedEvent`
+before the answer picker waits. Cancelled turns do not notify. It registers no
+tools or instructions and has no plugin settings. Its title is `CLAI2`; its
+messages contain only generic status text, never conversation content or errors.
+
+macOS uses `/usr/bin/osascript`; enable Script Editor notifications in System
+Settings > Notifications. Linux uses `/usr/bin/notify-send` when installed and a desktop
+notification service is available. OS permissions and Focus settings determine
+delivery. Windows, SSH, headless mode, and redirected output are skipped. Local
+tmux needs no passthrough because delivery uses the OS, not terminal escapes.
+The plugin does not detect focus and submits notifications even in the active
+terminal. Submission is awaited with a two-second timeout; missing services,
+nonzero exits, and timeouts are nonfatal. Cancellation still propagates. It emits
+no notification-specific telemetry.
+
+`/plugins disable notifications` persists an off override. Use
+`/plugins enable notifications` to load it again or `/plugins remove notifications`
+to restore the built-in default. Normal plugin unloading discards its handlers;
+there are no background workers to stop.
 
 ## Logfire: default agent tracing
 
@@ -138,9 +204,13 @@ clai2 --worktree my-task
 that directory before reading project settings or activating plugins. Relative paths in your plugin, the coding tools,
 and `repo_context` therefore refer to that checkout. User plugins and settings
 still load from the same database directory, even with a relative `--database`
-path. Only committed project files reach the new checkout. Worktrees and their
-`clai/NAME` branches stay on disk after the session ends; plugins do not own their
-cleanup. See [Git worktrees](README.md#git-worktrees) for naming and cleanup.
+path. Only committed project files reach the new checkout. After interactive
+shutdown and plugin cleanup, CLAI offers to remove the linked worktree, defaulting
+to keep. This includes existing linked worktrees. Removal uses Git without
+`--force` and keeps the branch; dirty or locked checkouts stay on disk.
+Headless runs, piped input, and startup errors do not prompt. `/new`, `/resume`,
+and `/reload` keep the checkout in use. Plugins do not own worktree cleanup.
+See [Git worktrees](README.md#git-worktrees) for naming and cleanup.
 
 ## The built-in plugins
 
@@ -572,11 +642,14 @@ A widget opened from inside a tool call, including the inline `ask_user` picker,
 has to wait for streamed text to finish and the editor and status row to
 get out of the way. `host.full_screen()` flushes pending output, suspends the
 editor's input reader, and restores the editor and its draft when the block exits.
-The editor remains active during agent turns. Enter steers the active run through
-core's `RunContext.enqueue(priority='asap')`, without starting another turn or
-cancelling tools. Alt+Enter queues a separate turn with its own `turn_start` and
-`turn_end` hooks. Slash commands always wait until the current turn ends.
-When idle, either submit key starts a turn. Shift-Enter inserts a newline.
+The editor remains active during agent turns. Enter queues a separate turn with
+its own `turn_start` and `turn_end` hooks. Alt+Enter (Option+Enter) sends the oldest
+queued follow-up to the active run through core's
+`RunContext.enqueue(priority='asap')`, without starting another turn, cancelling
+tools, or changing the draft. Each press sends one message. If the run is no
+longer accepting steering, the message stays queued. Slash commands and exit
+signals are not steered or skipped over. With no queued message, Alt+Enter does
+nothing. When idle, Enter starts a turn. Shift-Enter inserts a newline.
 Modified-key reporting is enabled only while the editor owns input.
 Option+Backspace (Alt+Backspace) deletes the word before the cursor, like Ctrl-W,
 including trailing whitespace. Spaces, tabs, and newlines separate words. Text
@@ -783,7 +856,9 @@ alter an already running request or revoke credentials at the provider.
 `/add_model` opens the provider catalog, connection setup, and per-model settings.
 `/add_model PROVIDER:NAME` adds a model directly. Adding a model also selects it
 for the next prompt. `/model` is a flat picker of added models, and `/model NAME`
-selects one without the menu. Its Tab suggestions contain only added models.
+selects one without the menu. Choose **Add a model...** in `/model` to browse
+providers and select a new model, including when the saved list is empty.
+Its Tab suggestions contain only added models.
 The list persists across sessions. The currently configured model is retained
 when upgrading; `/set model NAME` also saves the model in this list.
 
@@ -838,6 +913,16 @@ Tab completes added models.
 `Ctrl+S` in `/add_model` opens the same editor. Edits save immediately and apply
 on the next prompt. `r` resets a field; Esc or Ctrl-C goes back. Fixed choices
 open a picker; numeric fields accept typed values, and empty input resets.
+
+For `openai-codex` models, open `/model_settings openai-codex:gpt-6-astra`
+(or your saved Codex model), then **Service Tier / Fast Mode**. Choose
+**Fast (priority)** to request fast processing, or **Standard (default)** to
+turn it off. [Codex fast mode](https://developers.openai.com/codex/speed)
+uses more ChatGPT credits and depends on model and account availability. It does
+not lower reasoning effort. Reset restores the existing model default; it does
+not enable fast mode. The stored values remain `service_tier=priority` and
+`service_tier=default`, so older CLAI versions can read them. A custom
+`service_tier` body parameter still takes precedence.
 
 Model preferences are shared across checkouts. Reading saved preferences ignores
 unknown fields, so newer settings do not break an older reader with this

@@ -51,12 +51,25 @@ class ModelSettingsSource:
         for key, info in ModelSettingsForm.model_fields.items():
             if key not in options and key not in saved:
                 continue
+            codex_tier = key == 'service_tier' and self.model.startswith('openai-codex:')
             rows.append(
                 FieldRow(
                     key=key,
-                    label=_setting_label(key),
+                    label='Service Tier / Fast Mode' if codex_tier else _setting_label(key),
                     allow_custom=False,
-                    description=info.description or '',
+                    description=(
+                        'Fast mode uses more ChatGPT credits.\n'
+                        'Requests priority processing on supported Codex models.\n'
+                        'Availability depends on your model and account.\n'
+                        'Standard turns fast mode off.\n'
+                        'Reasoning effort is unchanged.\n'
+                        'Custom service_tier parameters override this setting.'
+                        if codex_tier
+                        else info.description or ''
+                    ),
+                    choice_labels={'priority': 'Fast (priority)', 'default': 'Standard (default)'}
+                    if codex_tier
+                    else {},
                     default=shown(model_defaults(model=self.model).get(key)),
                     choices=options.get(key, ()) or _choices(info.annotation),
                 )
@@ -281,11 +294,13 @@ def _run_provider(menu: ModelMenu, runners: Runners, messages: list[str]) -> boo
         return True
 
 
-async def open_add_model_menu(context: CommandContext, *, run: Callable[[ModelMenu], list[str]] | None = None) -> str:
+async def open_add_model_menu(
+    context: CommandContext, *, run: Callable[[ModelMenu], list[str]] | None = None, runners: Runners = TERMINAL
+) -> str:
     """Show the menu in a thread; the pick and any settings edits apply to the next prompt."""
 
     def flow(menu: ModelMenu) -> list[str]:
-        return run_model_flow(menu, connect_provider=True)
+        return run_model_flow(menu, runners, connect_provider=True)
 
     accumulated: list[str] = []
     while True:
