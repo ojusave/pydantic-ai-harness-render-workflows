@@ -42,19 +42,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - id: base
-        env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          # A new branch has no previous commit. Compare its full tree instead.
-          if [ "$BASE_SHA" = '0000000000000000000000000000000000000000' ]; then
-            BASE_SHA=$(git hash-object -t tree /dev/null)
-          fi
-          echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
-
       - id: detect
         env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
@@ -80,7 +70,7 @@ jobs:
       # two capabilities need independent answers anyway.
       - id: detect-mongodb
         env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
@@ -108,7 +98,7 @@ jobs:
       # store rather than the Mongo-backed capabilities.
       - id: detect-redis
         env:
-          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
