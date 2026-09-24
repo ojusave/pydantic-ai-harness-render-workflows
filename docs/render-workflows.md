@@ -122,10 +122,13 @@ Set `OPENAI_API_KEY` in the worker's environment, then replace `TestModel(custom
 
 ## Avoid HTTP timeouts for long-running LLM tasks
 
-For a FastAPI endpoint or another Python web application, submit `support` through Render's task client and return
-its run ID in an HTTP `202 Accepted` response. This avoids keeping the HTTP request open while the agent works;
-the client polls a status endpoint for the result or failure. Associate the ID with the requesting user so that endpoint
-can verify ownership, and keep Render credentials on the server.
+To avoid making a web request wait for the agent to finish, your FastAPI or other Python web application can start
+the `support` task defined above on Render and return a run ID to the browser or API client. Use HTTP `202 Accepted`
+to indicate that the job has been accepted for processing.
+
+The caller can then use that ID to check progress through a status endpoint you add to your application. This endpoint
+retrieves the run's status from Render and returns its result or error when it finishes. Check that the run belongs
+to the requesting user before returning any details, and keep Render API credentials on the server.
 
 Deploy the exported `app` as a Workflow with the start command `uv run render-workflows app:app`, and configure its
 provider credentials. Render's [workflow setup](https://render.com/docs/workflows) and
