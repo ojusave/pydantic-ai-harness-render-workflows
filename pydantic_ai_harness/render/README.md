@@ -1,15 +1,9 @@
 # Render Workflows
 
-Run long-running AI agents in the background with separate retries, timeouts, and compute settings for model requests
+With Render Workflows you can have long-running AI agents in the background with separate retries, timeouts, and compute settings for model requests
 and tool calls. The [Render Workflows](https://render.com/docs/workflows) integration runs the agent loop in an entry
 task and supported operations as child tasks, each with its own status, logs, and result. For example, a tool that
 processes a large document can have a longer timeout than the model calls around it.
-
-If you only need background execution, a native Render task around `agent.run(...)` may be enough.
-
-[Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/render/)
-
-> While Pydantic AI Harness is on 0.x releases, the API may change between minor releases; when it does, deprecation warnings and release-note migration guidance tell you (or your agent) exactly how to upgrade. See the [version policy](https://github.com/pydantic/pydantic-ai-harness#version-policy).
 
 ## Before you start
 
