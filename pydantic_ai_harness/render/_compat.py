@@ -431,6 +431,8 @@ _NONE_UNLESS_ATTACHED = (
     'realtime_session',
     '_durable_operations',
     '_run_capabilities_by_id',
+    # A child process must enter its own toolset instead of reusing the parent's.
+    '_run_held_toolsets',
 )
 _DEFAULTED_UNLESS_CARRIED: tuple[tuple[str, Any], ...] = (('_anchored_evidence', AnchoredEvidence()),)
 _RENAMED_FIELDS: tuple[tuple[str, str], ...] = (

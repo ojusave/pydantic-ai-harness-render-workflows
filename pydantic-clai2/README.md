@@ -12,6 +12,11 @@ Context management is the built-in `compaction` plugin,
 The `/plugins` menu also lists every other harness capability, disabled by
 default. Press Space to enable one. Some need optional packages, credentials,
 or constructor settings first; see [optional harness capabilities](PLUGINS.md#optional-harness-capabilities).
+The `render_workflows` entry is a catalog reference. Render execution requires
+Python code that creates a `Workflows` app, attaches the capability when constructing
+the agent, and runs it inside the matching `@workflows.task` entry point.
+Ordinary CLAI turns do not provide that runtime; see the
+[Render setup guide](../pydantic_ai_harness/render/README.md).
 The built-in `mcp` plugin includes the MCP client and `/mcp` command. Configure
 trusted stdio or Streamable HTTP servers through plugin settings; no server is
 connected by default. `/mcp` lists configuration, and `/mcp tools NAME` connects

@@ -153,6 +153,13 @@ def fake_mcp_toolset() -> tuple[MCPToolset[None], list[tuple[str, dict[str, Any]
             self.include_return_schema = None
             self.id = 'remote-tools'
 
+        async def __aenter__(self) -> FakeMCPToolset:
+            # This in-memory double owns no client connection.
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
         async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
             tool_def = ToolDefinition(
                 name='remote_lookup',

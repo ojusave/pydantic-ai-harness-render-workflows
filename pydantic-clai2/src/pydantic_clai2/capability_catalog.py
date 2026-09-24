@@ -36,6 +36,7 @@ _FACTORIES = (
     ('playwright', 'playwright:PlaywrightBrowser'),
     ('prompt_injection_defender', 'prompt_injection_defender:PromptInjectionDefender'),
     ('pydantic_ai_docs', 'pydantic_ai_docs:PydanticAIDocs'),
+    ('render_workflows', 'render:RenderWorkflows'),
     ('repair_tool_arguments', 'repair_tool_arguments:RepairToolArguments'),
     ('researcher', 'researcher:Researcher'),
     ('shell', 'shell:Shell'),

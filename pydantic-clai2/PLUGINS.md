@@ -306,6 +306,12 @@ Removing an optional built-in restores its disabled declaration; enable and
 disable choices persist between launches. Project, drop-in, and saved declarations
 retain their usual precedence over built-ins.
 
+The `render_workflows` entry is a catalog reference. Render execution requires
+Python code that creates a `Workflows` app, attaches the capability when constructing
+the agent, and runs it inside the matching `@workflows.task` entry point.
+Ordinary CLAI turns do not provide that runtime; see the
+[Render setup guide](../pydantic_ai_harness/render/README.md).
+
 `/plugins disable coder` gives you a chat-only CLAI (a writing or research setup
 with `ExaSearch` instead, say); `/plugins enable coder` brings the tools back;
 `/plugins remove coder` cannot forget a built-in, so it resets it to its
