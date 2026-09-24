@@ -91,7 +91,7 @@ async def test_enter_queues_alt_enter_steers_oldest(sequence: str) -> None:
         live.feed('enter')
         assert await live.read() == '/help'
         assert accepted == ['change direction']
-        assert 'Enter: submit' in Text.from_ansi(live.frame()[-1]).plain
+        assert Text.from_ansi(live.frame()[-1]).plain == 'ready'
 
         def idle(text: str) -> bool:
             return False
@@ -100,6 +100,23 @@ async def test_enter_queues_alt_enter_steers_oldest(sequence: str) -> None:
         live.buffer.replace('idle prompt')
         live.feed('enter')
         assert await live.read() == 'idle prompt'
+
+
+async def test_bare_clear_queues_as_a_command_that_steering_skips() -> None:
+    attempted: list[str] = []
+
+    def steer(text: str) -> bool:
+        attempted.append(text)
+        return True
+
+    async with editor() as (live, _, _):
+        live.steer = steer
+        live.buffer.replace(' Clear ')
+        live.feed('enter')
+        assert live.queued_messages == ('/clear',)
+        live.feed('alt-enter')
+        assert attempted == []
+        assert await live.read() == '/clear'
 
 
 @pytest.mark.parametrize('head', ['/help', KeyboardInterrupt(), EOFError(), 'follow up'])

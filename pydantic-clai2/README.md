@@ -12,17 +12,21 @@ Context management is the built-in `compaction` plugin,
 The `/plugins` menu also lists every other harness capability, disabled by
 default. Press Space to enable one. Some need optional packages, credentials,
 or constructor settings first; see [optional harness capabilities](PLUGINS.md#optional-harness-capabilities).
-The built-in `mcp` plugin includes the MCP client and `/mcp` command. Configure
-trusted stdio or Streamable HTTP servers through plugin settings; no server is
-connected by default. `/mcp` lists configuration, and `/mcp tools NAME` connects
-briefly to discover tools. HTTP redirects are rejected; use the final endpoint URL.
-During runs, core manages connections and prefixes
-tool names with the configured server name. Local server programs still need to
-be installed separately. Settings are plain JSON, so avoid storing secrets there.
-See [Connect MCP servers](PLUGINS.md#connect-mcp-servers) for configuration and
-trust guidance. `/plugins disable mcp` removes its command and tools.
+`/mcp` manages MCP servers the way Code Puppy's `/mcp` does. Bare `/mcp` shows a
+status dashboard. `/mcp install` opens a form where you name the server, pick
+`stdio`, `http`, or `sse`, type its URL or command, edit the rest of its JSON
+configuration in your editor, and switch on OAuth sign-in for remote servers.
+`/mcp edit NAME` reopens the same form. `/mcp start NAME`, `stop NAME`,
+`restart NAME`, `status NAME`, `logs NAME [LINES]`, `auth NAME [logout]`,
+`remove NAME`, and `trust [status|accept|revoke]` manage servers, and `/mcp help`
+lists them all. Saved servers are available to the agent from the next prompt,
+with tool names prefixed by the server name. A server connects on the first
+prompt that needs it (or `/mcp start`) and stays connected; one that cannot
+connect is marked `error` and left out rather than failing the prompt. See
+[Connect MCP servers](PLUGINS.md#connect-mcp-servers) for storage, secrets, OAuth,
+and project trust. `/plugins disable mcp` removes the command and tools.
 
-Python 3.11+ is required by Termflow. Tracking issue: https://github.com/pydantic/pydantic-ai-harness/issues/875.
+Python 3.10+ is required.
 
 CLAI file tools can access paths outside the workspace, including `/tmp`, and do
 not protect secret files or repository metadata. OS permissions still apply.
@@ -42,8 +46,10 @@ default. Plugin-provided rendering, including interactive questions, is unchange
 
 `clai2 --help` parses arguments without loading the agent or plugins. Interactive
 startup defers model menus and provider integrations until you open those menus,
-log in, or run a prompt. The first use can therefore take longer. Enabled plugins
-still load before the first prompt; their initialization contributes to startup time.
+log in, or run a prompt. Once the prompt is ready, a background thread imports
+them, so the first prompt usually finds them loaded; if it arrives sooner, it waits
+for the rest of those imports. Enabled plugins still load before the first prompt;
+their initialization contributes to startup time.
 `/login` offers both Codex and GitHub Copilot without loading their integrations for
 completion. Copilot requests use your saved login through the lazy provider resolver.
 
@@ -145,7 +151,8 @@ the number waiting. This is a read-only preview, not a queue editor. Control byt
 text are escaped in previews and prompt echoes; the submitted text is unchanged.
 
 Messages and slash commands run in submission order, after the current turn and its cleanup
-finish. They do not interrupt or steer the active turn. An unsubmitted draft stays
+finish. They do not interrupt or steer the active turn. Bare settings menus such as
+`/set` are the exception: they open during the turn (see "Settings and commands"). An unsubmitted draft stays
 in the editor as turns finish. Queued messages are not saved as conversation turns
 until execution starts, and are discarded on exit or `/reload`.
 
@@ -196,11 +203,11 @@ to `config.db`: `$XDG_CONFIG_HOME/pydantic-clai2/input-history`, or
 to its owner (mode 0600). Avoid entering secrets in the prompt: input history is
 not encrypted. Delete this file while CLAI is closed to clear saved input.
 `/new` starts a new saved conversation, without deleting the previous one or
-input recall. Model responses and tool results are not saved to this file.
+input recall. `/clear`, or bare `clear`, is an alias of `/new`. Model responses and tool results are not saved to this file.
 
 ## CI coverage
 
-The `CLAI coverage` check combines branch coverage from Python 3.11 and 3.14
+The `CLAI coverage` check combines branch coverage from Python 3.10 and 3.14
 and requires 100% for `src/pydantic_clai2`. It is separate from Harness coverage;
 passing CLAI test jobs alone does not mean either coverage gate has passed.
 Tracked under [#875](https://github.com/pydantic/pydantic-ai-harness/issues/875).
@@ -420,6 +427,13 @@ anything not listed), everything else a typed input that validates as you go.
 An empty value resets. `R` resets the highlighted setting. Esc closes. Every
 edit saves and applies immediately, the same as `/set KEY VALUE`.
 
+While a turn is running, `/set`, `/model`, `/add_model`, `/model_settings`,
+`/theme`, and `/spinner` typed without arguments open their menu right away
+instead of queueing. The turn keeps running: its output is held while the menu is open
+and printed in order when the menu closes. A question from the agent waits for
+the menu to close. Model and run settings saved in the menu apply once the
+running turn ends. With arguments, these commands queue like any other.
+
 `run.tool_retries` sets the default retry budget per tool call, starting at `3`.
 Use a non-negative integer; `0` disables retries. Changes apply to the next turn.
 Explicit per-tool or per-toolset retry limits take precedence. This setting does
@@ -630,7 +644,7 @@ the project file. `/plugins disable repo_context` turns it off, for this and
 every later session; `/plugins enable repo_context` brings it back. See
 [PLUGINS.md](PLUGINS.md#the-built-in-plugins) for its settings.
 
-Interactive commands: `/login`, `/set`, `/theme`, `/model`, `/add_model`, `/model_settings`, `/help`, `/new`, `/resume`, `/exit`, `/config`,
+Interactive commands: `/login`, `/set`, `/theme`, `/model`, `/add_model`, `/model_settings`, `/help`, `/new`, `/clear`, `/resume`, `/exit`, `/config`,
 `/plugins`, `/reload`, `/usage`, `/cost`, and `/compact` from the built-in `compaction` plugin.
 Tab completion suggests commands, settings, boolean values, plugin identifiers,
 and paths after `@`. Suggestions match any substring, case-sensitively. For paths,
@@ -941,6 +955,53 @@ The early splash retains its brand colours. Code uses the terminal foreground
 and ANSI syntax colours; bundled palettes use Termflow's default diff colours. Theme selection adds no
 model requests or telemetry.
 
+### Spinners
+
+```text
+/spinner
+/spinner puppy
+/spinner zoomies 0.1
+/spinner init
+/set display.spinner dots
+```
+
+The spinner is the animation in the `Working` title above the prompt while a turn
+runs. `working`, the braille CLAI has always shown, is the default. The catalogue
+also carries every Code Puppy builtin: `puppy`, `bone`, `zoomies`, `paws`, `dots`,
+`dotsWide`, `dots8Bit`, `dotsCircle`, `sand`, `growVertical`, `growHorizontal`,
+`noise`, `binary`, `chevrons`, `bouncingBar`, `bouncingBall`, `pong`, `fistBump`,
+and `aesthetic`.
+
+`/spinner` opens a searchable picker with an animated preview. `-`/`+` (or
+Left/Right) make the highlighted spinner slower or faster in steps of 0.02 seconds;
+Enter applies it, Esc keeps your current choice. `/spinner NAME [SECONDS]` applies
+by name, ignoring case, and Tab completes the names. The choice is saved as
+`display.spinner` and shows on the next frame, with no restart.
+
+A changed speed, from the picker or `SECONDS`, is saved as that spinner's
+`interval` in `spinners.json` next to CLAI's settings
+(`~/.config/pydantic-clai2/spinners.json`). The file is also where you add your
+own; `/spinner init` writes a starter:
+
+```json
+{
+  "sniffer": {
+    "frames": ["( .    ) ", "(  .   ) ", "(   .  ) ", "(    . ) "],
+    "interval": 0.1,
+    "description": "a very minimalist puppy"
+  },
+  "zoomies": {"interval": 0.2}
+}
+```
+
+An entry with `frames` defines a spinner; one without `frames` that names an
+existing spinner changes only its `interval` or `description`. Entries in the file
+replace builtins and plugin spinners of the same name. Intervals are clamped to
+0.02-1 seconds and frames to 40 characters, padded to one width so the title does
+not shift. Edits apply on the next frame. `/spinner` lists any entry it skipped
+and why. A saved name that no longer exists, such as a removed plugin's, shows
+`working`. Plugins add spinners with `host.spinner` (see `PLUGINS.md`).
+
 ### Streaming
 
 Streaming uses the defaults from [Code Puppy's smoothing adapters](https://github.com/mpfaffenberger/code_puppy/blob/a862bf478b63822c9d97093f81e4f827e1c53d6e/code_puppy/agents/smooth_stream.py):
@@ -1039,6 +1100,65 @@ Shell output permits ANSI SGR color/style sequences, decoded into Rich text rath
 than passed directly to the terminal. Styles persist across chunks and lines per
 command; cursor movement, clipboard commands, and other controls remain escaped.
 Plain shell output stays dim. ANSI generated by Termflow itself is retained.
+
+## Speculative execution
+
+Press **Ctrl+X Ctrl+S** to switch speculative execution on or off, the same chord
+as Code Puppy. It is off by default and saved as `run.speculative_code_mode`, so
+`/set run.speculative_code_mode true` does the same. The next turn uses the new
+value; a turn already running keeps the tools it started with.
+
+While it is on, every tool except `write_file` and `edit_file` becomes a
+function inside one harness `CodeMode` `run_code` tool, `shell` included. Other
+tools that run a program passed as a string, such as a workflow plugin, stay
+native as `CodeMode` keeps them by default.
+
+`run_code` is a persistent Python sandbox with the working directory mounted
+read-write at its real path, isolated environment variables, the host clock
+(through `datetime`), and no network. The model writes one snippet that calls many tools, and CLAI runs it while the model
+is still writing:
+
+- **Eager execution** runs each complete statement as soon as it has streamed,
+  so a slow `shell` build or test starts before the snippet is finished.
+- **Speculation** starts `list_files`, `read_file`, `grep`, and
+  `read_clai_customization_guide` calls whose arguments are all literals the
+  moment their line has streamed. Only these
+  read-only tools speculate, because an early call may belong to a branch the
+  snippet never takes. They must come from CLAI's own file tools and guide: a
+  plugin or MCP tool with the same name, or one that declares itself read-only,
+  waits like any other call. Writes and shell commands never start speculatively.
+
+The model gets instructions for writing snippets that benefit. On Anthropic
+models CLAI also sets `anthropic_eager_input_streaming`, since Anthropic
+otherwise sends tool arguments in one burst at the end, which leaves no time to
+run anything early.
+
+Tools called from inside `run_code` show the same headers, previews, and shell
+output as direct calls, listed under their `run_code` header in the order they
+ran. A speculative call is shown only once the snippet uses its result, so a
+launch for a branch the snippet never took does not appear.
+
+A pinned row above the footer shows the session's totals while the switch is on:
+
+```text
+Speculative Execution  29 hits · 0 misses · 0 wasted    saved ≥ 7.0s
+```
+
+- **hits:** sandbox calls that adopted a speculative launch.
+- **misses:** speculation-eligible calls that ran without a matching launch.
+- **wasted:** launches discarded without being used.
+- **saved ≥:** the summed durations of speculative calls that had finished
+  before the snippet asked for them, plus the time sandbox calls spent running
+  while the `run_code` arguments were still streaming. Calls still running when
+  claimed count as hits but add no time; restarted, rejected, or cancelled
+  snippets add nothing. It is a lower bound on hidden tool latency, not
+  wall-clock speedup, since concurrent calls can overlap.
+
+Counts are coloured only when non-zero, using `/theme` colours. Switching off
+hides the row; switching back on shows the same session totals. Headless runs
+and redirected output use the same tools but show no row. Speculative execution
+needs `pydantic-monty` (`pip install "pydantic-ai-harness[code-mode]"`); without
+it, CLAI prints a warning and runs tools natively.
 
 ## Status line
 
